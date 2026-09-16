@@ -206,7 +206,8 @@ def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
         vendor_chain = all_available_vendors
 
     last_no_data: NoMarketDataError | None = None
-    first_error: Exception | None = None
+    first_traced_error: Exception | None = None
+    first_legacy_error: Exception | None = None
     warnings: list[str] = []
     only_not_configured = True
     for vendor in vendor_chain:
@@ -224,14 +225,16 @@ def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
             warnings.append(f"{vendor}: {type(e).__name__}: {e}")
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
             only_not_configured = False
-            if first_error is None:
-                first_error = e
+            if first_traced_error is None:
+                first_traced_error = e
             continue
         except VendorNotConfiguredError as e:
             warnings.append(f"{vendor}: {type(e).__name__}: {e}")
             logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
-            if first_error is None:
-                first_error = e  # Surface it if no other vendor can serve the call.
+            if first_traced_error is None:
+                first_traced_error = e
+            if first_legacy_error is None:
+                first_legacy_error = e  # Surface it if no other vendor can serve the call.
             continue
         except NoMarketDataError as e:
             warnings.append(f"{vendor}: {type(e).__name__}: {e}")
@@ -244,8 +247,10 @@ def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
             # serve it, but never swallow silently: a broken primary must be
             # visible in the logs (#989), not hidden behind a fallback's verdict.
             logger.warning("Vendor %r failed for %s: %s", vendor, method, e)
-            if first_error is None:
-                first_error = e
+            if first_traced_error is None:
+                first_traced_error = e
+            if first_legacy_error is None:
+                first_legacy_error = e
             only_not_configured = False
             continue
 
@@ -254,12 +259,12 @@ def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
     # empty string, so the agent reports "unavailable" instead of inventing a
     # value. This takes precedence over incidental fallback errors.
     if last_no_data is not None:
-        if first_error is not None:
+        if first_legacy_error is not None:
             # A vendor also hit a real error; surface it in logs so the no-data
             # verdict can't hide a broken primary (network/auth/etc.).
             logger.warning(
                 "Returning NO_DATA for %s, but a vendor errored earlier: %s",
-                method, first_error,
+                method, first_legacy_error,
             )
         sym = last_no_data.symbol
         canonical = last_no_data.canonical
@@ -285,19 +290,32 @@ def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
     # first real error (e.g. the primary vendor's network failure). Optional
     # enrichment categories degrade to a sentinel instead, so flavour data can't
     # abort the run.
-    if first_error is not None:
+    if first_traced_error is not None:
         if category in OPTIONAL_CATEGORIES:
-            logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
-            content = (
-                f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
-                f"({first_error}). Proceed without it; do not fabricate values."
-            )
+            if first_legacy_error is not None:
+                logger.warning(
+                    "Optional %s unavailable for %s: %s",
+                    category, method, first_legacy_error,
+                )
+                content = (
+                    f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
+                    f"({first_legacy_error}). Proceed without it; do not fabricate values."
+                )
+                return VendorRouteResult(
+                    content=content,
+                    status="unavailable" if only_not_configured else "error",
+                    source=None,
+                    warnings=tuple(warnings),
+                    retryable=not only_not_configured,
+                )
+            legacy_error = RuntimeError(f"No available vendor for '{method}'")
             return VendorRouteResult(
-                content=content,
+                content=None,
                 status="error",
                 source=None,
                 warnings=tuple(warnings),
                 retryable=True,
+                legacy_error=legacy_error,
             )
         if only_not_configured:
             return VendorRouteResult(
@@ -305,15 +323,16 @@ def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
                 status="unavailable",
                 source=None,
                 warnings=tuple(warnings),
-                legacy_error=first_error,
+                legacy_error=first_legacy_error,
             )
+        legacy_error = first_legacy_error or RuntimeError(f"No available vendor for '{method}'")
         return VendorRouteResult(
             content=None,
             status="error",
             source=None,
             warnings=tuple(warnings),
             retryable=True,
-            legacy_error=first_error,
+            legacy_error=legacy_error,
         )
 
     raise RuntimeError(f"No available vendor for '{method}'")

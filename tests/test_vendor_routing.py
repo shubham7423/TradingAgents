@@ -151,6 +151,59 @@ class VendorRoutingTests(unittest.TestCase):
                     "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
                 )
 
+    def test_trace_classifies_optional_missing_only_as_unavailable(self):
+        missing = interface.VendorNotConfiguredError("missing key")
+        set_config({"data_vendors": {"macro_data": "fred"}})
+        with self._route_method("get_macro_indicators", {"fred": _raises(missing)}):
+            traced = interface.route_to_vendor_traced(
+                "get_macro_indicators", "cpi", "2026-01-01"
+            )
+            legacy = interface.route_to_vendor("get_macro_indicators", "cpi", "2026-01-01")
+
+        self.assertEqual(traced.status, "unavailable")
+        self.assertFalse(traced.retryable)
+        self.assertIn("DATA_UNAVAILABLE", traced.content)
+        self.assertIsNone(traced.legacy_error)
+        self.assertEqual(legacy, traced.content)
+
+    def test_trace_sole_rate_limit_preserves_legacy_runtime_error(self):
+        rate_limit = interface.VendorRateLimitError("slow down")
+        set_config({"data_vendors": {"core_stock_apis": "yfinance"}})
+        with self._route({"yfinance": _raises(rate_limit)}):
+            traced = interface.route_to_vendor_traced(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                interface.route_to_vendor(
+                    "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+                )
+
+        self.assertEqual(traced.status, "error")
+        self.assertTrue(traced.retryable)
+        self.assertIsInstance(traced.legacy_error, RuntimeError)
+        self.assertNotIsInstance(ctx.exception, interface.VendorRateLimitError)
+
+    def test_trace_rate_limit_before_later_error_preserves_later_legacy_error(self):
+        rate_limit = interface.VendorRateLimitError("slow down")
+        later_error = RuntimeError("fallback failed")
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
+        with self._route({
+            "yfinance": _raises(rate_limit),
+            "alpha_vantage": _raises(later_error),
+        }):
+            traced = interface.route_to_vendor_traced(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                interface.route_to_vendor(
+                    "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+                )
+
+        self.assertEqual(traced.status, "error")
+        self.assertTrue(traced.retryable)
+        self.assertIs(traced.legacy_error, later_error)
+        self.assertIs(ctx.exception, later_error)
+
 
 if __name__ == "__main__":
     unittest.main()
