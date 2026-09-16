@@ -40,14 +40,16 @@ def _create_evidence_run(
     *,
     request_id: str = REQUEST_ID,
     stage: str = "analyst/market",
+    analysis_date: str = "2026-09-15",
     frozen_config: dict | None = None,
+    instrument: dict | None = None,
 ):
     record, _ = store.create_run(
         request_id=request_id,
         request_hash=request_id,
         normalized_inputs={
             "ticker": "AAPL",
-            "analysis_date": "2026-09-15",
+            "analysis_date": analysis_date,
             "analysts": [stage.removeprefix("analyst/")],
             "research_rounds": 1,
             "risk_rounds": 1,
@@ -59,7 +61,11 @@ def _create_evidence_run(
             if frozen_config is None
             else frozen_config
         ),
-        instrument={"canonical_symbol": "AAPL", "source": "yfinance"},
+        instrument=(
+            {"canonical_symbol": "AAPL", "source": "yfinance"}
+            if instrument is None
+            else instrument
+        ),
         lessons="",
         now="2026-09-15T12:00:00+00:00",
     )
@@ -279,7 +285,19 @@ def test_start_analysis_reads_point_in_time_lessons(store, monkeypatch):
         "default mixed with vendor",
     ],
 )
-def test_invalid_start_request_does_not_persist(change, tools, store):
+def test_invalid_start_request_does_not_persist(change, tools, store, monkeypatch):
+    from tradingagents.llm_clients import factory
+
+    monkeypatch.setattr(
+        factory,
+        "create_llm_client",
+        lambda *args, **kwargs: pytest.fail("LLM client constructed"),
+    )
+    monkeypatch.setattr(
+        data,
+        "resolve_instrument_identity",
+        lambda ticker: pytest.fail("identity network path called"),
+    )
     values = {"request_id": REQUEST_ID, "ticker": "AAPL", **change}
 
     with pytest.raises((ValidationError, ValueError)):
@@ -615,3 +633,492 @@ def test_execute_preserves_missing_key_unavailable(tools):
     assert result.content == ""
     assert result.source == "unknown"
     assert result.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("method_name", "domain_args", "routed_args", "expected_source"),
+    [
+        (
+            "get_stock_data",
+            ("AAPL", "2026-09-01", "2026-09-15"),
+            ("get_stock_data", "AAPL", "2026-09-01", "2026-09-15"),
+            "yfinance",
+        ),
+        (
+            "get_indicators",
+            ("AAPL", "rsi", "2026-09-15", 14),
+            ("get_indicators", "AAPL", "rsi", "2026-09-15", 14),
+            "yfinance",
+        ),
+        (
+            "get_fundamentals",
+            ("AAPL", "2026-09-15"),
+            ("get_fundamentals", "AAPL", "2026-09-15"),
+            "alpha_vantage",
+        ),
+        (
+            "get_balance_sheet",
+            ("AAPL", "annual", "2026-09-15"),
+            ("get_balance_sheet", "AAPL", "annual", "2026-09-15"),
+            "alpha_vantage",
+        ),
+        (
+            "get_cashflow",
+            ("AAPL", "annual", "2026-09-15"),
+            ("get_cashflow", "AAPL", "annual", "2026-09-15"),
+            "alpha_vantage",
+        ),
+        (
+            "get_income_statement",
+            ("AAPL", "annual", "2026-09-15"),
+            ("get_income_statement", "AAPL", "annual", "2026-09-15"),
+            "alpha_vantage",
+        ),
+    ],
+)
+def test_market_and_fundamental_methods_forward_exact_arguments(
+    tools, monkeypatch, method_name, domain_args, routed_args, expected_source
+):
+    calls = []
+
+    def route(*args):
+        calls.append(args)
+        return VendorRouteResult(content={"method": method_name}, status="success", source=expected_source)
+
+    monkeypatch.setattr(data, "route_to_vendor_traced", route)
+
+    result = getattr(tools, method_name)(*domain_args)
+
+    assert calls == [routed_args]
+    assert result.status == "success"
+    assert result.content == f'{{"method":"{method_name}"}}'
+    assert result.content_format == "json"
+    assert result.source == expected_source
+    assert result.warnings == []
+    assert result.reused is False
+    assert result.retryable is False
+    assert result.evidence_id is None
+    assert result.run_id is None
+    assert result.page.complete is True
+
+
+def test_market_snapshot_uses_verified_builder_and_unknown_source(tools, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        data,
+        "build_verified_market_snapshot",
+        lambda *args: calls.append(args) or "verified snapshot",
+    )
+
+    result = tools.get_verified_market_snapshot("AAPL", "2026-09-15", 12)
+
+    assert calls == [("AAPL", "2026-09-15", 12)]
+    assert result.status == "success"
+    assert result.content == "verified snapshot"
+    assert result.source == "unknown"
+
+
+def test_market_snapshot_maps_no_data_and_retryable_errors(tools, monkeypatch):
+    error = data.NoMarketDataError("AAPL", detail="no rows")
+    monkeypatch.setattr(
+        data,
+        "build_verified_market_snapshot",
+        lambda *args: (_ for _ in ()).throw(error),
+    )
+
+    no_data = tools.get_verified_market_snapshot("AAPL", "2026-09-15")
+
+    assert no_data.status == "no_data"
+    assert no_data.content == (
+        "NO_DATA_AVAILABLE: No usable market data for 'AAPL' from any configured vendor "
+        "(no rows). The symbol may be invalid, delisted, not covered, or the vendor returned "
+        "stale data. Do not estimate or fabricate values — report that data is unavailable "
+        "for this symbol."
+    )
+    assert no_data.source == "unknown"
+    assert no_data.retryable is False
+
+    monkeypatch.setattr(
+        data,
+        "build_verified_market_snapshot",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("network down")),
+    )
+    failed = tools.get_verified_market_snapshot("AAPL", "2026-09-15")
+
+    assert failed.status == "error"
+    assert failed.retryable is True
+    assert "network down" in failed.content
+
+
+def test_market_route_preserves_no_data_content(tools, monkeypatch):
+    from tradingagents.dataflows import interface
+
+    def no_rows(*args):
+        raise data.NoMarketDataError(args[0], detail="no rows")
+
+    monkeypatch.setattr(interface, "get_vendor", lambda *args: "yfinance")
+    monkeypatch.setitem(interface.VENDOR_METHODS, "get_stock_data", {"yfinance": no_rows})
+
+    result = tools.get_stock_data("AAPL", "2026-09-01", "2026-09-15")
+
+    assert result.status == "no_data"
+    assert result.content.startswith("NO_DATA_AVAILABLE: No usable market data for 'AAPL'")
+    assert result.source == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("method_name", "domain_args", "routed_args", "expected_source"),
+    [
+        (
+            "get_news",
+            ("AAPL", "2026-09-01", "2026-09-15"),
+            ("get_news", "AAPL", "2026-09-01", "2026-09-15"),
+            "yfinance",
+        ),
+        (
+            "get_global_news",
+            ("2026-09-15", 7, 20),
+            ("get_global_news", "2026-09-15", 7, 20),
+            "alpha_vantage",
+        ),
+        (
+            "get_insider_transactions",
+            ("AAPL",),
+            ("get_insider_transactions", "AAPL"),
+            "yfinance",
+        ),
+        (
+            "get_macro_indicators",
+            ("cpi", "2026-09-15", 365),
+            ("get_macro_indicators", "cpi", "2026-09-15", 365),
+            "fred",
+        ),
+        (
+            "get_prediction_markets",
+            ("rates", 4),
+            ("get_prediction_markets", "rates", 4),
+            "polymarket",
+        ),
+    ],
+)
+def test_contextual_methods_forward_exact_arguments(
+    tools, monkeypatch, method_name, domain_args, routed_args, expected_source
+):
+    calls = []
+
+    def route(*args):
+        calls.append(args)
+        return VendorRouteResult(content="evidence", status="success", source=expected_source)
+
+    monkeypatch.setattr(data, "route_to_vendor_traced", route)
+
+    result = getattr(tools, method_name)(*domain_args)
+
+    assert calls == [routed_args]
+    assert result.status == "success"
+    assert result.content == "evidence"
+    assert result.source == expected_source
+
+
+def test_contextual_missing_fred_is_terminal_unavailable(tools, monkeypatch):
+    monkeypatch.setattr(
+        data,
+        "route_to_vendor_traced",
+        lambda *args: VendorRouteResult(
+            content="DATA_UNAVAILABLE: missing FRED API key",
+            status="unavailable",
+            source=None,
+            warnings=("fred: VendorNotConfiguredError: missing API key",),
+        ),
+    )
+
+    result = tools.get_macro_indicators("cpi", "2026-09-15")
+
+    assert result.status == "unavailable"
+    assert result.source == "unknown"
+    assert result.retryable is False
+    assert result.warnings == ["fred: VendorNotConfiguredError: missing API key"]
+
+
+@pytest.mark.parametrize("method_name", ["get_insider_transactions", "get_prediction_markets"])
+def test_contextual_historical_no_date_methods_warn(
+    tools, store, monkeypatch, method_name
+):
+    run = _create_evidence_run(
+        store,
+        stage="analyst/news",
+        analysis_date="2026-09-14",
+    )
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    monkeypatch.setattr(
+        data,
+        "route_to_vendor_traced",
+        lambda *args: VendorRouteResult(content="live evidence", status="success", source="test"),
+    )
+
+    result = (
+        tools.get_insider_transactions("AAPL", run_id=run.run_id)
+        if method_name == "get_insider_transactions"
+        else tools.get_prediction_markets("rates", run_id=run.run_id)
+    )
+
+    assert result.status == "success"
+    assert any("historical" in warning and "point-in-time" in warning for warning in result.warnings)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "patched_name", "domain_args", "expected_call", "expected_source"),
+    [
+        (
+            "fetch_stocktwits_messages",
+            "_fetch_stocktwits_messages",
+            ("AAPL", 20, "2026-09-01", "2026-09-15"),
+            (("AAPL", 20), {"start_date": "2026-09-01", "end_date": "2026-09-15"}),
+            "stocktwits",
+        ),
+        (
+            "fetch_reddit_posts",
+            "_fetch_reddit_posts",
+            ("AAPL", 8, "2026-09-01", "2026-09-15"),
+            (
+                ("AAPL",),
+                {
+                    "limit_per_sub": 8,
+                    "start_date": "2026-09-01",
+                    "end_date": "2026-09-15",
+                },
+            ),
+            "reddit",
+        ),
+    ],
+)
+def test_social_methods_forward_bounded_windows(
+    tools,
+    monkeypatch,
+    method_name,
+    patched_name,
+    domain_args,
+    expected_call,
+    expected_source,
+):
+    calls = []
+
+    def fetch(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "social evidence"
+
+    monkeypatch.setattr(data, patched_name, fetch)
+
+    result = getattr(tools, method_name)(*domain_args)
+
+    assert calls == [expected_call]
+    assert result.status == "success"
+    assert result.source == expected_source
+
+
+def test_social_failure_and_partial_reddit_classification(tools, monkeypatch):
+    monkeypatch.setattr(
+        data,
+        "_fetch_stocktwits_messages",
+        lambda *args, **kwargs: "<stocktwits unavailable: TimeoutError>",
+    )
+    stocktwits = tools.fetch_stocktwits_messages("AAPL")
+
+    assert stocktwits.status == "error"
+    assert stocktwits.retryable is True
+
+    monkeypatch.setattr(
+        data,
+        "_fetch_reddit_posts",
+        lambda *args, **kwargs: (
+            "<no Reddit posts found mentioning AAPL across r/stocks in the past 7 days>\n"
+            "<unavailable (fetch failed): r/investing>"
+        ),
+    )
+    partial = tools.fetch_reddit_posts("AAPL")
+
+    assert partial.status == "success"
+    assert partial.retryable is False
+    assert partial.warnings == ["Reddit sources unavailable: r/investing"]
+
+    monkeypatch.setattr(
+        data,
+        "_fetch_reddit_posts",
+        lambda *args, **kwargs: (
+            "<Reddit unavailable: every source failed to fetch (r/stocks, r/investing)>"
+        ),
+    )
+    failed = tools.fetch_reddit_posts("AAPL")
+
+    assert failed.status == "error"
+    assert failed.retryable is True
+
+
+@pytest.mark.parametrize(
+    ("ticker", "canonical", "asset_type", "context_word"),
+    [
+        ("CNC.TO", "CNC.TO", "stock", "instrument"),
+        ("XAUUSD+", "GC=F", "stock", "instrument"),
+        ("BTCUSD", "BTC-USD", "crypto", "asset"),
+    ],
+)
+def test_identity_normalizes_and_builds_standalone_context(
+    tools, monkeypatch, ticker, canonical, asset_type, context_word
+):
+    monkeypatch.setattr(
+        data,
+        "resolve_instrument_identity_data",
+        lambda value: {"company_name": f"Identity for {value}"},
+    )
+
+    result = tools.resolve_instrument_identity(ticker)
+    payload = data.json.loads(result.content)
+
+    assert payload["requested_symbol"] == ticker.upper()
+    assert payload["canonical_symbol"] == canonical
+    assert payload["asset_type"] == asset_type
+    assert f"The {context_word} to analyze is `{canonical}`" in payload["context"]
+    assert result.source == "yfinance"
+    assert result.warnings == []
+    assert result.reused is False
+    assert result.run_id is None
+
+
+def test_identity_metadata_failure_keeps_normalized_result_with_warning(tools, monkeypatch):
+    monkeypatch.setattr(data, "resolve_instrument_identity_data", lambda ticker: {})
+
+    result = tools.resolve_instrument_identity("XAUUSD+")
+
+    assert data.json.loads(result.content)["canonical_symbol"] == "GC=F"
+    assert result.status == "success"
+    assert result.source == "symbol_utils"
+    assert result.warnings == ["yfinance identity metadata unavailable"]
+
+
+def test_identity_run_returns_frozen_instrument_without_resolution(tools, store, monkeypatch):
+    run = _create_evidence_run(store)
+    monkeypatch.setattr(
+        data,
+        "resolve_instrument_identity_data",
+        lambda ticker: pytest.fail("identity resolver called"),
+    )
+
+    result = tools.resolve_instrument_identity("AAPL", run_id=run.run_id)
+
+    assert data.json.loads(result.content) == {"canonical_symbol": "AAPL", "source": "yfinance"}
+    assert result.source == "yfinance"
+    assert result.reused is True
+
+
+def test_identity_run_warns_when_frozen_metadata_is_unavailable(tools, store):
+    run = _create_evidence_run(
+        store,
+        instrument={"canonical_symbol": "AAPL", "source": "symbol_utils"},
+    )
+
+    result = tools.resolve_instrument_identity("AAPL", run_id=run.run_id)
+
+    assert result.source == "symbol_utils"
+    assert result.warnings == ["yfinance identity metadata unavailable"]
+
+
+def test_public_method_validation_precedes_fetch(tools, monkeypatch):
+    from tradingagents.llm_clients import factory
+
+    monkeypatch.setattr(
+        factory,
+        "create_llm_client",
+        lambda *args, **kwargs: pytest.fail("LLM client constructed"),
+    )
+    monkeypatch.setattr(
+        data,
+        "route_to_vendor_traced",
+        lambda *args: pytest.fail("route called"),
+    )
+    monkeypatch.setattr(
+        data,
+        "_fetch_stocktwits_messages",
+        lambda *args, **kwargs: pytest.fail("StockTwits called"),
+    )
+
+    with pytest.raises(ValueError, match="one indicator"):
+        tools.get_indicators("AAPL", "rsi,macd", "2026-09-15")
+    with pytest.raises(ValueError, match="start_date"):
+        tools.get_news("AAPL", "2026-09-16", "2026-09-15")
+    with pytest.raises(ValueError, match="limit"):
+        tools.fetch_stocktwits_messages("AAPL", 101)
+
+
+def test_status_reuse_and_continuation_do_not_construct_llm_or_call_network(
+    tools, store, monkeypatch
+):
+    from tradingagents.llm_clients import factory
+
+    run = _create_evidence_run(store)
+    arguments = {
+        "symbol": "AAPL",
+        "start_date": "2026-09-01",
+        "end_date": "2026-09-15",
+    }
+    store.save_evidence(
+        run_id=run.run_id,
+        expected_stage=run.current_stage,
+        tool_name="get_stock_data",
+        argument_hash=data._digest(arguments),
+        arguments=arguments,
+        status="success",
+        fetched_at="2026-09-15T12:01:00+00:00",
+        requested_window={"start": "2026-09-01", "end": "2026-09-15"},
+        content="x" * 1_200,
+        content_format="text",
+        source={"vendor": "yfinance"},
+        warnings=[],
+    )
+    monkeypatch.setattr(
+        factory,
+        "create_llm_client",
+        lambda *args, **kwargs: pytest.fail("LLM client constructed"),
+    )
+    monkeypatch.setattr(
+        data,
+        "route_to_vendor_traced",
+        lambda *args: pytest.fail("network route called"),
+    )
+    monkeypatch.setattr(
+        data,
+        "build_verified_market_snapshot",
+        lambda *args: pytest.fail("snapshot network path called"),
+    )
+    monkeypatch.setattr(
+        data,
+        "_fetch_stocktwits_messages",
+        lambda *args, **kwargs: pytest.fail("StockTwits called"),
+    )
+    monkeypatch.setattr(
+        data,
+        "_fetch_reddit_posts",
+        lambda *args, **kwargs: pytest.fail("Reddit called"),
+    )
+    monkeypatch.setattr(
+        data,
+        "resolve_instrument_identity_data",
+        lambda *args: pytest.fail("identity network path called"),
+    )
+
+    analysis = tools.get_analysis(run.run_id)
+    first = tools.get_stock_data(
+        "AAPL", "2026-09-01", "2026-09-15", run_id=run.run_id, page_size=500
+    )
+    second = tools.get_stock_data(
+        "AAPL",
+        "2026-09-01",
+        "2026-09-15",
+        run_id=run.run_id,
+        cursor=first.page.next_cursor,
+        page_size=500,
+    )
+
+    assert analysis.run_id == run.run_id
+    assert first.reused is True
+    assert second.reused is True
+    assert [len(first.content), len(second.content)] == [500, 500]

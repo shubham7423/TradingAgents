@@ -19,8 +19,18 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import get_config, replace_config
-from tradingagents.dataflows.interface import TOOLS_CATEGORIES, VENDOR_METHODS, VendorRouteResult
-from tradingagents.dataflows.symbol_utils import normalize_symbol
+from tradingagents.dataflows.interface import (
+    TOOLS_CATEGORIES,
+    VENDOR_METHODS,
+    VendorRouteResult,
+    route_to_vendor_traced,
+)
+from tradingagents.dataflows.market_data_validator import build_verified_market_snapshot
+from tradingagents.dataflows.reddit import fetch_reddit_posts as _fetch_reddit_posts
+from tradingagents.dataflows.stocktwits import (
+    fetch_stocktwits_messages as _fetch_stocktwits_messages,
+)
+from tradingagents.dataflows.symbol_utils import NoMarketDataError, crypto_base, normalize_symbol
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
 from tradingagents.plugin.store import EvidenceRecord, PluginStore, RunRecord
@@ -30,6 +40,7 @@ AssetType = Literal["stock", "crypto"]
 MAX_ROUNDS = 10
 MAX_PAGE_SIZE = 32_000
 _DATA_LOCK = Lock()
+resolve_instrument_identity_data = resolve_instrument_identity
 
 DATA_CONFIG_KEYS = (
     "data_cache_dir",
@@ -200,6 +211,44 @@ def _validate_ticker(value: str) -> str:
     return normalize_symbol(trimmed)
 
 
+def _validate_date(value: str, name: str) -> str:
+    try:
+        return date.fromisoformat(value).isoformat()
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a real date in YYYY-MM-DD format") from exc
+
+
+def _validate_window(
+    start_date: str | None, end_date: str | None
+) -> tuple[str | None, str | None]:
+    if (start_date is None) != (end_date is None):
+        raise ValueError("start_date and end_date must be provided together")
+    if start_date is None:
+        return None, None
+    start = _validate_date(start_date, "start_date")
+    end = _validate_date(end_date, "end_date")
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    return start, end
+
+
+def _validate_limit(value: int, name: str) -> int:
+    if type(value) is not int or not 1 <= value <= 100:
+        raise ValueError(f"{name} must be between 1 and 100")
+    return value
+
+
+def _no_market_data_content(error: NoMarketDataError) -> str:
+    resolved = "" if error.canonical == error.symbol else f" (resolved to '{error.canonical}')"
+    reason = f" ({error.detail})" if error.detail else ""
+    return (
+        f"NO_DATA_AVAILABLE: No usable market data for '{error.symbol}'{resolved} from "
+        f"any configured vendor{reason}. The symbol may be invalid, delisted, not covered, "
+        "or the vendor returned stale data. Do not estimate or fabricate values — report that "
+        "data is unavailable for this symbol."
+    )
+
+
 def _validate_run_call(run: RunRecord, tool_name: str, arguments: dict) -> None:
     if run.status != "active":
         raise ValueError(f"analysis {run.run_id} is not active")
@@ -208,14 +257,15 @@ def _validate_run_call(run: RunRecord, tool_name: str, arguments: dict) -> None:
     ):
         raise ValueError(f"tool {tool_name} is not allowed at stage {run.current_stage}")
 
-    ticker = arguments.get("ticker")
+    ticker = arguments.get("ticker", arguments.get("symbol"))
     if ticker is not None and _validate_ticker(ticker) != run.instrument["canonical_symbol"]:
         raise ValueError("ticker does not match the analysis instrument")
 
     analysis_date = date.fromisoformat(run.normalized_inputs["analysis_date"])
-    curr_date = arguments.get("curr_date")
-    if curr_date is not None and date.fromisoformat(curr_date) != analysis_date:
-        raise ValueError("curr_date must match the analysis date")
+    if "curr_date" in arguments:
+        curr_date = arguments["curr_date"]
+        if curr_date is None or date.fromisoformat(curr_date) != analysis_date:
+            raise ValueError("curr_date must match the analysis date")
 
     start_value = arguments.get("start_date")
     end_value = arguments.get("end_date")
@@ -356,6 +406,457 @@ class PluginTools:
         self._store = store
         self._server_config = deepcopy(server_config if server_config is not None else get_config())
 
+    def get_stock_data(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        symbol = _validate_ticker(symbol)
+        start_date, end_date = _validate_window(start_date, end_date)
+        arguments = {"symbol": symbol, "start_date": start_date, "end_date": end_date}
+        return self._execute(
+            "get_stock_data",
+            arguments,
+            {"start": start_date, "end": end_date},
+            lambda: route_to_vendor_traced(
+                "get_stock_data", symbol, start_date, end_date
+            ),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_indicators(
+        self,
+        symbol: str,
+        indicator: str,
+        curr_date: str,
+        look_back_days: int = 30,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        symbol = _validate_ticker(symbol)
+        curr_date = _validate_date(curr_date, "curr_date")
+        if not indicator.strip() or "," in indicator:
+            raise ValueError("indicator must specify one indicator per call")
+        arguments = {
+            "symbol": symbol,
+            "indicator": indicator,
+            "curr_date": curr_date,
+            "look_back_days": look_back_days,
+        }
+        return self._execute(
+            "get_indicators",
+            arguments,
+            {"end": curr_date, "look_back_days": look_back_days},
+            lambda: route_to_vendor_traced(
+                "get_indicators", symbol, indicator, curr_date, look_back_days
+            ),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_verified_market_snapshot(
+        self,
+        symbol: str,
+        curr_date: str,
+        look_back_days: int = 30,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        symbol = _validate_ticker(symbol)
+        curr_date = _validate_date(curr_date, "curr_date")
+        arguments = {
+            "symbol": symbol,
+            "curr_date": curr_date,
+            "look_back_days": look_back_days,
+        }
+
+        def fetch() -> VendorRouteResult:
+            try:
+                content = build_verified_market_snapshot(symbol, curr_date, look_back_days)
+            except NoMarketDataError as exc:
+                return VendorRouteResult(
+                    content=_no_market_data_content(exc),
+                    status="no_data",
+                    source=None,
+                    warnings=(f"NoMarketDataError: {exc}",),
+                )
+            except Exception as exc:  # noqa: BLE001 - expose retryable snapshot failures
+                return VendorRouteResult(
+                    content=(
+                        "Error building verified market snapshot: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    status="error",
+                    source=None,
+                    warnings=(f"{type(exc).__name__}: {exc}",),
+                    retryable=True,
+                )
+            return VendorRouteResult(content=content, status="success", source=None)
+
+        return self._execute(
+            "get_verified_market_snapshot",
+            arguments,
+            {"end": curr_date, "look_back_days": look_back_days},
+            fetch,
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_fundamentals(
+        self,
+        ticker: str,
+        curr_date: str,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        ticker = _validate_ticker(ticker)
+        curr_date = _validate_date(curr_date, "curr_date")
+        arguments = {"ticker": ticker, "curr_date": curr_date}
+        return self._execute(
+            "get_fundamentals",
+            arguments,
+            {"end": curr_date},
+            lambda: route_to_vendor_traced("get_fundamentals", ticker, curr_date),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_balance_sheet(
+        self,
+        ticker: str,
+        freq: str = "quarterly",
+        curr_date: str | None = None,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        return self._statement(
+            "get_balance_sheet", ticker, freq, curr_date, run_id, cursor, page_size
+        )
+
+    def get_cashflow(
+        self,
+        ticker: str,
+        freq: str = "quarterly",
+        curr_date: str | None = None,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        return self._statement("get_cashflow", ticker, freq, curr_date, run_id, cursor, page_size)
+
+    def get_income_statement(
+        self,
+        ticker: str,
+        freq: str = "quarterly",
+        curr_date: str | None = None,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        return self._statement(
+            "get_income_statement", ticker, freq, curr_date, run_id, cursor, page_size
+        )
+
+    def _statement(
+        self,
+        tool_name: str,
+        ticker: str,
+        freq: str,
+        curr_date: str | None,
+        run_id: str | None,
+        cursor: str | None,
+        page_size: int | None,
+    ) -> DataToolResult:
+        ticker = _validate_ticker(ticker)
+        if curr_date is not None:
+            curr_date = _validate_date(curr_date, "curr_date")
+        arguments = {"ticker": ticker, "freq": freq, "curr_date": curr_date}
+        return self._execute(
+            tool_name,
+            arguments,
+            {} if curr_date is None else {"end": curr_date},
+            lambda: route_to_vendor_traced(tool_name, ticker, freq, curr_date),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_news(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        ticker = _validate_ticker(ticker)
+        start_date, end_date = _validate_window(start_date, end_date)
+        arguments = {"ticker": ticker, "start_date": start_date, "end_date": end_date}
+        return self._execute(
+            "get_news",
+            arguments,
+            {"start": start_date, "end": end_date},
+            lambda: route_to_vendor_traced("get_news", ticker, start_date, end_date),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_global_news(
+        self,
+        curr_date: str,
+        look_back_days: int | None = None,
+        limit: int | None = None,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        curr_date = _validate_date(curr_date, "curr_date")
+        arguments = {
+            "curr_date": curr_date,
+            "look_back_days": look_back_days,
+            "limit": limit,
+        }
+        return self._execute(
+            "get_global_news",
+            arguments,
+            {"end": curr_date, "look_back_days": look_back_days},
+            lambda: route_to_vendor_traced(
+                "get_global_news", curr_date, look_back_days, limit
+            ),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_insider_transactions(
+        self,
+        ticker: str,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        ticker = _validate_ticker(ticker)
+        arguments = {"ticker": ticker}
+        return self._execute(
+            "get_insider_transactions",
+            arguments,
+            {},
+            lambda: self._historical_result(
+                route_to_vendor_traced("get_insider_transactions", ticker), run_id
+            ),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_macro_indicators(
+        self,
+        indicator: str,
+        curr_date: str,
+        look_back_days: int | None = None,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        curr_date = _validate_date(curr_date, "curr_date")
+        arguments = {
+            "indicator": indicator,
+            "curr_date": curr_date,
+            "look_back_days": look_back_days,
+        }
+        return self._execute(
+            "get_macro_indicators",
+            arguments,
+            {"end": curr_date, "look_back_days": look_back_days},
+            lambda: route_to_vendor_traced(
+                "get_macro_indicators", indicator, curr_date, look_back_days
+            ),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def get_prediction_markets(
+        self,
+        topic: str,
+        limit: int | None = None,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        arguments = {"topic": topic, "limit": limit}
+        return self._execute(
+            "get_prediction_markets",
+            arguments,
+            {},
+            lambda: self._historical_result(
+                route_to_vendor_traced("get_prediction_markets", topic, limit), run_id
+            ),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def _historical_result(
+        self, result: VendorRouteResult, run_id: str | None
+    ) -> VendorRouteResult:
+        if run_id is None:
+            return result
+        analysis_date = self._store.get_run(run_id).normalized_inputs["analysis_date"]
+        if analysis_date >= get_current_date():
+            return result
+        return VendorRouteResult(
+            content=result.content,
+            status=result.status,
+            source=result.source,
+            warnings=(
+                *result.warnings,
+                "historical coverage warning: this source has no point-in-time cutoff; "
+                "results may include information published after the analysis date.",
+            ),
+            retryable=result.retryable,
+            legacy_error=result.legacy_error,
+        )
+
+    def resolve_instrument_identity(
+        self, ticker: str, run_id: str | None = None
+    ) -> DataToolResult:
+        requested = ticker.strip().upper()
+        canonical = _validate_ticker(ticker)
+
+        def fetch() -> VendorRouteResult:
+            try:
+                metadata = resolve_instrument_identity_data(canonical)
+            except Exception:  # noqa: BLE001 - identity enrichment is best effort
+                metadata = {}
+            asset_type = "crypto" if crypto_base(canonical) else "stock"
+            instrument = {
+                "requested_symbol": requested,
+                "canonical_symbol": canonical,
+                "asset_type": asset_type,
+                "metadata": metadata,
+                "context": build_instrument_context(canonical, asset_type, metadata),
+                "source": "yfinance" if metadata else "symbol_utils",
+            }
+            return VendorRouteResult(
+                content=instrument,
+                status="success",
+                source=instrument["source"],
+                warnings=() if metadata else ("yfinance identity metadata unavailable",),
+            )
+
+        return self._execute(
+            "resolve_instrument_identity",
+            {"ticker": ticker},
+            {},
+            fetch,
+            run_id,
+            None,
+            None,
+        )
+
+    def fetch_stocktwits_messages(
+        self,
+        ticker: str,
+        limit: int = 30,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        ticker = _validate_ticker(ticker)
+        limit = _validate_limit(limit, "limit")
+        start_date, end_date = _validate_window(start_date, end_date)
+        arguments = {
+            "ticker": ticker,
+            "limit": limit,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        return self._execute(
+            "fetch_stocktwits_messages",
+            arguments,
+            {} if start_date is None else {"start": start_date, "end": end_date},
+            lambda: VendorRouteResult(
+                content=_fetch_stocktwits_messages(
+                    ticker, limit, start_date=start_date, end_date=end_date
+                ),
+                status="success",
+                source="stocktwits",
+            ),
+            run_id,
+            cursor,
+            page_size,
+        )
+
+    def fetch_reddit_posts(
+        self,
+        ticker: str,
+        limit_per_sub: int = 5,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        *,
+        run_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> DataToolResult:
+        ticker = _validate_ticker(ticker)
+        limit_per_sub = _validate_limit(limit_per_sub, "limit_per_sub")
+        start_date, end_date = _validate_window(start_date, end_date)
+        arguments = {
+            "ticker": ticker,
+            "limit_per_sub": limit_per_sub,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        return self._execute(
+            "fetch_reddit_posts",
+            arguments,
+            {} if start_date is None else {"start": start_date, "end": end_date},
+            lambda: VendorRouteResult(
+                content=_fetch_reddit_posts(
+                    ticker,
+                    limit_per_sub=limit_per_sub,
+                    start_date=start_date,
+                    end_date=end_date,
+                ),
+                status="success",
+                source="reddit",
+            ),
+            run_id,
+            cursor,
+            page_size,
+        )
+
     def _execute(
         self,
         tool_name: str,
@@ -395,7 +896,11 @@ class PluginTools:
                 content=content,
                 content_format=content_format,
                 source=run.instrument.get("source", "unknown"),
-                warnings=[],
+                warnings=(
+                    ["yfinance identity metadata unavailable"]
+                    if run.instrument.get("source") == "symbol_utils"
+                    else []
+                ),
                 fetched_at=run.created_at,
                 reused=True,
                 retryable=False,
