@@ -24,6 +24,7 @@ from tradingagents.dataflows.interface import (
     VENDOR_METHODS,
     VendorRouteResult,
     route_to_vendor_traced,
+    sanitize_diagnostic,
 )
 from tradingagents.dataflows.market_data_validator import build_verified_market_snapshot
 from tradingagents.dataflows.reddit import fetch_reddit_posts as _fetch_reddit_posts
@@ -130,8 +131,29 @@ def _classify_result(
 ]:
     content, content_format = _serialize_content(result.content)
     status = result.status
-    warnings = list(result.warnings)
+    warnings = [sanitize_diagnostic(warning) for warning in result.warnings]
     retryable = result.retryable
+
+    malformed_payload = False
+    candidate = result.content if isinstance(result.content, Mapping) else None
+    if candidate is None and content_format == "text" and content.lstrip().startswith("{"):
+        try:
+            candidate = json.loads(content)
+        except json.JSONDecodeError:
+            candidate = None
+    if isinstance(candidate, dict) and any(
+        field in candidate for field in ("Error Message", "Information", "Note")
+    ):
+        malformed_payload = True
+
+    failure_sentinel = (
+        content.startswith(("Error fetching", "Error retrieving", "Error:"))
+        or "currently unavailable (network error" in content
+        or content.startswith("<stocktwits unavailable")
+    )
+
+    if status != "success" or malformed_payload or failure_sentinel:
+        content = sanitize_diagnostic(content)
 
     if content.startswith("<Reddit unavailable: every source failed"):
         status, retryable = "error", True
@@ -156,11 +178,7 @@ def _classify_result(
             status, retryable = "no_data", False
         elif "public stream serves only recent messages" in content:
             status, retryable = "unavailable", False
-        elif (
-            content.startswith("Error fetching")
-            or "currently unavailable (network error" in content
-            or content.startswith("<stocktwits unavailable")
-        ):
+        elif failure_sentinel or malformed_payload:
             status, retryable = "error", True
 
     return status, content, content_format, warnings, retryable
@@ -271,6 +289,8 @@ def _validate_run_call(run: RunRecord, tool_name: str, arguments: dict) -> None:
 
     start_value = arguments.get("start_date")
     end_value = arguments.get("end_date")
+    if "start_date" in arguments or "end_date" in arguments:
+        _validate_window(start_value, end_value)
     start_date = date.fromisoformat(start_value) if start_value is not None else None
     end_date = date.fromisoformat(end_value) if end_value is not None else None
     if start_date is not None and end_date is not None and start_date > end_date:

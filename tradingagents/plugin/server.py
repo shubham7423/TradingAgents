@@ -166,16 +166,22 @@ def prepare_state_root(path: str | Path) -> Path:
 
 def create_server(state_root: str | Path) -> FastMCP:
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.tools import Tool
 
     from tradingagents.plugin.data import PluginTools
     from tradingagents.plugin.store import PluginStore
 
-    server = FastMCP("TradingAgents", log_level="WARNING")
     tools = PluginTools(PluginStore(state_root))
-    server.tool()(get_capabilities)
-    for operation in tools.public_operations():
-        server.tool()(operation)
-    return server
+    registered = []
+    for operation in (get_capabilities, *tools.public_operations()):
+        tool = Tool.from_function(operation)
+        # FastMCP 1.26 generates argument models with extra="ignore" by default.
+        arguments = tool.fn_metadata.arg_model
+        arguments.model_config["extra"] = "forbid"
+        arguments.model_rebuild(force=True)
+        tool.parameters = arguments.model_json_schema(by_alias=True)
+        registered.append(tool)
+    return FastMCP("TradingAgents", log_level="WARNING", tools=registered)
 
 
 def main(argv: list[str] | None = None) -> None:

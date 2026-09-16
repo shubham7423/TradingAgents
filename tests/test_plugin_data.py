@@ -1145,3 +1145,214 @@ def test_status_reuse_and_continuation_do_not_construct_llm_or_call_network(
     assert first.reused is True
     assert second.reused is True
     assert [len(first.content), len(second.content)] == [500, 500]
+
+
+def test_fallback_diagnostics_are_safe_when_saved_and_reused(tools, store, monkeypatch):
+    from tradingagents.dataflows import interface
+
+    run = _create_evidence_run(store, frozen_config={
+        "tool_vendors": {"get_stock_data": "alpha_vantage,yfinance"},
+    })
+    calls = []
+
+    def fail(*args):
+        calls.append(args)
+        raise RuntimeError("https://www.alphavantage.co/query?apikey=secret-token")
+
+    monkeypatch.setitem(interface.VENDOR_METHODS, "get_stock_data", {
+        "alpha_vantage": fail, "yfinance": lambda *args: "prices",
+    })
+    first = tools.get_stock_data("AAPL", "2026-09-01", "2026-09-15", run_id=run.run_id)
+    repeated = tools.get_stock_data("AAPL", "2026-09-01", "2026-09-15", run_id=run.run_id)
+    saved = PluginStore(store.database_path.parent).list_evidence(run.run_id)
+
+    assert first.status == "success" and repeated.reused
+    assert first.evidence_id == repeated.evidence_id
+    assert len(calls) == 1
+    assert len(saved) == 1
+    assert saved[0].warnings == first.warnings == repeated.warnings
+    assert "secret-token" not in first.model_dump_json() + str(saved)
+    assert "https://" not in first.model_dump_json() + str(saved)
+
+
+@pytest.mark.parametrize("method_name", [
+    "get_fundamentals", "get_balance_sheet", "get_cashflow", "get_income_statement",
+    "get_insider_transactions",
+])
+def test_provider_retrieval_failures_are_never_evidence(tools, store, monkeypatch, method_name):
+    from tradingagents.dataflows import date_window, y_finance
+
+    monkeypatch.setattr(date_window, "get_current_date", lambda: "2026-09-15")
+    stage = "analyst/news" if method_name == "get_insider_transactions" else "analyst/fundamentals"
+    run = _create_evidence_run(store, stage=stage, frozen_config={
+        "tool_vendors": {method_name: "yfinance"},
+    })
+    calls = []
+
+    def fail(ticker):
+        calls.append(ticker)
+        raise RuntimeError("temporary provider failure")
+
+    monkeypatch.setattr(y_finance.yf, "Ticker", fail)
+    kwargs = {} if method_name == "get_insider_transactions" else {"curr_date": "2026-09-15"}
+    for _ in range(2):
+        result = getattr(tools, method_name)("AAPL", run_id=run.run_id, **kwargs)
+        assert result.status == "error" and result.retryable
+        assert result.content.startswith("Error retrieving")
+        assert result.evidence_id is None and not result.reused
+    assert calls == ["AAPL", "AAPL"]
+    assert store.list_evidence(run.run_id) == []
+
+
+@pytest.mark.parametrize("response", [
+    RuntimeError("temporary provider failure"),
+    "",
+    "date,RSI\n2026-09-15,50",
+    "time,close\n2026-09-15,50",
+])
+def test_indicator_failure_sentinels_are_never_evidence(tools, store, monkeypatch, response):
+    from tradingagents.dataflows import alpha_vantage_indicator
+
+    run = _create_evidence_run(store, frozen_config={
+        "tool_vendors": {"get_indicators": "alpha_vantage"},
+    })
+    calls = []
+
+    def request(*args):
+        calls.append(args)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(alpha_vantage_indicator, "_make_api_request", request)
+    for _ in range(2):
+        result = tools.get_indicators("AAPL", "rsi", "2026-09-15", run_id=run.run_id)
+        assert result.status == "error" and result.retryable
+        assert result.evidence_id is None and not result.reused
+    assert len(calls) == 2
+    assert store.list_evidence(run.run_id) == []
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_alpha_vantage_auth_failures_have_distinct_persistence(tools, store, monkeypatch, missing):
+    from types import SimpleNamespace
+
+    from tradingagents.dataflows import alpha_vantage_common as av, interface
+
+    run = _create_evidence_run(store, stage="analyst/fundamentals", frozen_config={
+        "tool_vendors": {"get_balance_sheet": "alpha_vantage"},
+    })
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(
+            text='{"Information":"The parameter apikey is invalid or missing."}',
+            raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(av.requests, "get", request)
+    if missing:
+        monkeypatch.delenv("ALPHA_VANTAGE_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", "rejected-key")
+    results = [tools.get_balance_sheet("AAPL", curr_date="2026-09-15", run_id=run.run_id)
+               for _ in range(2)]
+
+    assert [result.status for result in results] == ["unavailable" if missing else "error"] * 2
+    assert [result.retryable for result in results] == [not missing] * 2
+    assert results[1].reused is missing
+    assert len(store.list_evidence(run.run_id)) == (1 if missing else 0)
+    assert len(calls) == (0 if missing else 2)
+    if not missing:
+        assert all(result.evidence_id is None for result in results)
+
+    with pytest.raises(av.AlphaVantageNotConfiguredError) as raised, monkeypatch.context() as patch:
+        patch.setattr(interface, "get_vendor", lambda *args: "alpha_vantage")
+        interface.route_to_vendor("get_balance_sheet", "AAPL", "quarterly", "2026-09-15")
+    assert type(raised.value) is av.AlphaVantageNotConfiguredError
+
+
+@pytest.mark.parametrize("method_name", ["fetch_stocktwits_messages", "fetch_reddit_posts"])
+def test_run_social_requires_explicit_window_before_fetch(tools, store, monkeypatch, method_name):
+    run = _create_evidence_run(store, stage="analyst/social", analysis_date="2020-01-02")
+    calls = []
+
+    def fetch(*args, **kwargs):
+        calls.append(kwargs)
+        return "social evidence"
+
+    monkeypatch.setattr(data, f"_{method_name}", fetch)
+    method = getattr(tools, method_name)
+    for window in ({}, {"start_date": "2020-01-01"}, {"end_date": "2020-01-02"},
+                   {"start_date": "2020-01-01", "end_date": "2020-01-03"}):
+        with pytest.raises(ValueError, match="start_date|end_date"):
+            method("AAPL", run_id=run.run_id, **window)
+    assert calls == []
+    assert store.list_evidence(run.run_id) == []
+
+    bounded = method("AAPL", run_id=run.run_id, start_date="2020-01-01", end_date="2020-01-02")
+    standalone = method("AAPL")
+    assert bounded.status == standalone.status == "success"
+    assert calls[0]["end_date"] == "2020-01-02"
+    assert calls[1]["start_date"] is calls[1]["end_date"] is None
+
+
+@pytest.mark.parametrize("field", ["Error Message", "Information", "Note"])
+def test_alpha_vantage_error_payloads_are_not_evidence(tools, store, monkeypatch, field):
+    import json
+    from types import SimpleNamespace
+
+    from tradingagents.dataflows import alpha_vantage_common as av
+
+    run = _create_evidence_run(store, stage="analyst/fundamentals", frozen_config={
+        "tool_vendors": {"get_balance_sheet": "alpha_vantage"},
+    })
+    body = json.dumps({field: "Provider could not process this request."})
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(text=body, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(av.requests, "get", request)
+    for _ in range(2):
+        result = tools.get_balance_sheet("AAPL", curr_date="2026-09-15", run_id=run.run_id)
+        assert result.status == "error" and result.retryable
+        assert result.content == body
+        assert result.evidence_id is None
+    assert len(calls) == 2
+    assert store.list_evidence(run.run_id) == []
+
+
+@pytest.mark.parametrize("path", ["indicator", "snapshot", "optional"])
+def test_error_diagnostics_redact_request_urls_and_keys(tools, store, monkeypatch, path):
+    from tradingagents.dataflows import alpha_vantage_indicator, interface
+
+    secret = "test-rejected-key"
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", secret)
+    error = RuntimeError(
+        f"Key {secret} failed: https://www.alphavantage.co/query?apikey={secret}"
+    )
+
+    def fail(*args):
+        raise error
+
+    stage = "analyst/news" if path == "optional" else "analyst/market"
+    run = _create_evidence_run(store, stage=stage, frozen_config={
+        "tool_vendors": {"get_indicators": "alpha_vantage", "get_macro_indicators": "fred"},
+    })
+    if path == "indicator":
+        monkeypatch.setattr(alpha_vantage_indicator, "_make_api_request", fail)
+        result = tools.get_indicators("AAPL", "rsi", "2026-09-15", run_id=run.run_id)
+    elif path == "snapshot":
+        monkeypatch.setattr(data, "build_verified_market_snapshot", fail)
+        result = tools.get_verified_market_snapshot("AAPL", "2026-09-15", run_id=run.run_id)
+    else:
+        monkeypatch.setitem(interface.VENDOR_METHODS, "get_macro_indicators", {"fred": fail})
+        result = tools.get_macro_indicators("cpi", "2026-09-15", run_id=run.run_id)
+
+    assert result.status == "error" and result.retryable
+    assert secret not in result.model_dump_json()
+    assert "https://" not in result.model_dump_json()
+    assert store.list_evidence(run.run_id) == []

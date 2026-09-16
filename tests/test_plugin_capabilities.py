@@ -1,8 +1,8 @@
+import asyncio
 import importlib
 import os
 import subprocess
 import sys
-from types import ModuleType
 
 import pytest
 
@@ -147,28 +147,14 @@ def test_discovery_does_not_call_network_or_runner(monkeypatch):
     assert get_capabilities().model_dump_json()
 
 
-def test_create_server_registers_public_tools(tmp_path, monkeypatch):
+def test_create_server_registers_public_tools(tmp_path):
+    pytest.importorskip("mcp")
     from tradingagents.plugin.server import create_server
 
-    registered = []
+    registered = asyncio.run(create_server(tmp_path).list_tools())
 
-    class FakeFastMCP:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def tool(self):
-            return registered.append
-
-    mcp = ModuleType("mcp")
-    server = ModuleType("mcp.server")
-    fastmcp = ModuleType("mcp.server.fastmcp")
-    fastmcp.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp", mcp)
-    monkeypatch.setitem(sys.modules, "mcp.server", server)
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp)
-
-    assert isinstance(create_server(tmp_path), FakeFastMCP)
-    assert {operation.__name__ for operation in registered} == EXPECTED_TOOLS
+    assert {tool.name for tool in registered} == EXPECTED_TOOLS
+    assert all(tool.inputSchema["additionalProperties"] is False for tool in registered)
 
 
 def test_discovery_imports_without_runner_or_global_config(tmp_path):

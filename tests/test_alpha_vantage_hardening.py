@@ -54,11 +54,23 @@ def test_invalid_key_not_mislabeled_as_rate_limit(monkeypatch):
     body = ('{"Information": "the parameter apikey is invalid or missing. '
             'Please claim your free API key on (https://www.alphavantage.co/support/#api-key)."}')
     monkeypatch.setattr(av.requests, "get", _patched_get(body))
-    with pytest.raises(av.AlphaVantageNotConfiguredError):
+    with pytest.raises(av.AlphaVantageNotConfiguredError) as raised:
         av._make_api_request("TIME_SERIES_DAILY", {"symbol": "AAPL"})
+    assert raised.value.authentication_failed is True
     with pytest.raises(av.AlphaVantageRateLimitError):  # sanity: rate-limit path still distinct
         monkeypatch.setattr(av.requests, "get", _patched_get('{"Note": "API call frequency is 5 calls per minute."}'))
         av._make_api_request("TIME_SERIES_DAILY", {"symbol": "AAPL"})
+
+
+@pytest.mark.unit
+def test_invalid_key_error_message_is_retryable_auth_failure(monkeypatch):
+    body = '{"Error Message": "The parameter apikey is invalid or missing."}'
+    monkeypatch.setattr(av.requests, "get", _patched_get(body))
+
+    with pytest.raises(av.AlphaVantageNotConfiguredError) as raised:
+        av._make_api_request("TIME_SERIES_DAILY", {"symbol": "AAPL"})
+
+    assert raised.value.authentication_failed is True
 
 
 _FUNDAMENTALS_JSON = json.dumps({
