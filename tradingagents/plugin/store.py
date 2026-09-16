@@ -282,11 +282,12 @@ class PluginStore:
             evidence_id = str(uuid4())
             inserted = connection.execute(
                 """
-                INSERT OR IGNORE INTO evidence (
+                INSERT INTO evidence (
                     evidence_id, run_id, stage_id, tool_name, argument_hash, arguments_json,
                     status, fetched_at, requested_window_json, content, content_format,
                     source_json, warnings_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, stage_id, tool_name, argument_hash) DO NOTHING
                 """,
                 (
                     evidence_id,

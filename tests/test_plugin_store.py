@@ -84,6 +84,29 @@ def test_evidence_is_unique_and_stale_stage_is_rejected(tmp_path):
         store.save_evidence(**{**values, "expected_stage": "analyst/news"})
 
 
+def test_invalid_evidence_status_is_rejected_without_persistence(tmp_path):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        store.save_evidence(
+            run_id=run.run_id,
+            expected_stage="analyst/market",
+            tool_name="get_stock_data",
+            argument_hash="args-hash",
+            arguments={"symbol": "AAPL"},
+            status="retryable_error",
+            fetched_at="2026-09-15T12:01:00+00:00",
+            requested_window={"start": "2026-09-01", "end": "2026-09-15"},
+            content="rate limited",
+            content_format="text",
+            source={"vendor": "yfinance"},
+            warnings=[],
+        )
+
+    assert store.list_evidence(run.run_id) == []
+
+
 def test_incompatible_schema_is_rejected_without_mutation(tmp_path):
     store = PluginStore(tmp_path)
     with sqlite3.connect(store.database_path) as connection:
