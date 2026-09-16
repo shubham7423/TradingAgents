@@ -30,6 +30,12 @@ def set_config(config: dict):
             _config[key] = value
 
 
+def replace_config(config: dict) -> None:
+    """Replace the complete active configuration without aliasing caller data."""
+    global _config
+    _config = deepcopy(config)
+
+
 def get_config() -> dict:
     """Get the current configuration."""
     if _config is None:

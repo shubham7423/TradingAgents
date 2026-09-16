@@ -118,6 +118,39 @@ class VendorRoutingTests(unittest.TestCase):
                 self.assertRaises(ValueError):
             interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
 
+    def test_trace_reports_actual_fallback_vendor_and_warning(self):
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
+        with self._route({
+            "yfinance": _raises(RuntimeError("primary failed")),
+            "alpha_vantage": _returns("AV_DATA"),
+        }):
+            traced = interface.route_to_vendor_traced(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+            legacy = interface.route_to_vendor(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+
+        self.assertEqual(traced.content, "AV_DATA")
+        self.assertEqual(traced.status, "success")
+        self.assertEqual(traced.source, "alpha_vantage")
+        self.assertTrue(any("yfinance" in warning for warning in traced.warnings))
+        self.assertEqual(legacy, "AV_DATA")
+
+    def test_trace_classifies_missing_only_vendor_without_changing_legacy_raise(self):
+        missing = interface.VendorNotConfiguredError("missing key")
+        set_config({"data_vendors": {"core_stock_apis": "alpha_vantage"}})
+        with self._route({"alpha_vantage": _raises(missing)}):
+            traced = interface.route_to_vendor_traced(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+            self.assertEqual(traced.status, "unavailable")
+            self.assertFalse(traced.retryable)
+            with self.assertRaises(interface.VendorNotConfiguredError):
+                interface.route_to_vendor(
+                    "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

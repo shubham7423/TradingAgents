@@ -1,4 +1,7 @@
 import logging
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Literal
 
 from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
@@ -31,6 +34,16 @@ from .y_finance import (
 from .yfinance_news import get_global_news_yfinance, get_news_yfinance
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class VendorRouteResult:
+    content: object
+    status: Literal["success", "no_data", "unavailable", "error"]
+    source: str | None
+    warnings: Sequence[str] = ()
+    retryable: bool = False
+    legacy_error: Exception | None = field(default=None, repr=False, compare=False)
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -165,7 +178,7 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
-def route_to_vendor(method: str, *args, **kwargs):
+def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
@@ -194,30 +207,46 @@ def route_to_vendor(method: str, *args, **kwargs):
 
     last_no_data: NoMarketDataError | None = None
     first_error: Exception | None = None
+    warnings: list[str] = []
+    only_not_configured = True
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
-        except VendorRateLimitError:
+            return VendorRouteResult(
+                content=impl_func(*args, **kwargs),
+                status="success",
+                source=vendor,
+                warnings=tuple(warnings),
+            )
+        except VendorRateLimitError as e:
+            warnings.append(f"{vendor}: {type(e).__name__}: {e}")
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
+            only_not_configured = False
+            if first_error is None:
+                first_error = e
             continue
         except VendorNotConfiguredError as e:
+            warnings.append(f"{vendor}: {type(e).__name__}: {e}")
             logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
             if first_error is None:
                 first_error = e  # Surface it if no other vendor can serve the call.
             continue
         except NoMarketDataError as e:
+            warnings.append(f"{vendor}: {type(e).__name__}: {e}")
             last_no_data = e  # No data here; another configured vendor may have it
+            only_not_configured = False
             continue
         except Exception as e:
+            warnings.append(f"{vendor}: {type(e).__name__}: {e}")
             # Don't let one vendor's failure crash the call when another can
             # serve it, but never swallow silently: a broken primary must be
             # visible in the logs (#989), not hidden behind a fallback's verdict.
             logger.warning("Vendor %r failed for %s: %s", vendor, method, e)
             if first_error is None:
                 first_error = e
+            only_not_configured = False
             continue
 
     # If any vendor reported "no data", the symbol is genuinely unavailable.
@@ -239,11 +268,17 @@ def route_to_vendor(method: str, *args, **kwargs):
         # stale") so the agent sees the specific reason — invalid symbol, no
         # coverage, or stale data — not just a generic "unavailable".
         reason = f" ({last_no_data.detail})" if last_no_data.detail else ""
-        return (
+        content = (
             f"NO_DATA_AVAILABLE: No usable market data for '{sym}'{resolved} from "
             f"any configured vendor{reason}. The symbol may be invalid, delisted, "
             f"not covered, or the vendor returned stale data. Do not estimate or "
             f"fabricate values — report that data is unavailable for this symbol."
+        )
+        return VendorRouteResult(
+            content=content,
+            status="no_data",
+            source=None,
+            warnings=tuple(warnings),
         )
 
     # No vendor returned data and none reported clean "no data" — surface the
@@ -253,10 +288,39 @@ def route_to_vendor(method: str, *args, **kwargs):
     if first_error is not None:
         if category in OPTIONAL_CATEGORIES:
             logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
-            return (
+            content = (
                 f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
                 f"({first_error}). Proceed without it; do not fabricate values."
             )
-        raise first_error
+            return VendorRouteResult(
+                content=content,
+                status="error",
+                source=None,
+                warnings=tuple(warnings),
+                retryable=True,
+            )
+        if only_not_configured:
+            return VendorRouteResult(
+                content=None,
+                status="unavailable",
+                source=None,
+                warnings=tuple(warnings),
+                legacy_error=first_error,
+            )
+        return VendorRouteResult(
+            content=None,
+            status="error",
+            source=None,
+            warnings=tuple(warnings),
+            retryable=True,
+            legacy_error=first_error,
+        )
 
     raise RuntimeError(f"No available vendor for '{method}'")
+
+
+def route_to_vendor(method: str, *args, **kwargs):
+    result = route_to_vendor_traced(method, *args, **kwargs)
+    if result.legacy_error is not None:
+        raise result.legacy_error
+    return result.content
