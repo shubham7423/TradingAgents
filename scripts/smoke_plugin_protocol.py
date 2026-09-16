@@ -10,6 +10,27 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+EXPECTED_TOOLS = {
+    "get_capabilities",
+    "start_analysis",
+    "get_analysis",
+    "get_stock_data",
+    "get_indicators",
+    "get_verified_market_snapshot",
+    "get_fundamentals",
+    "get_balance_sheet",
+    "get_cashflow",
+    "get_income_statement",
+    "get_news",
+    "get_global_news",
+    "get_insider_transactions",
+    "get_macro_indicators",
+    "get_prediction_markets",
+    "resolve_instrument_identity",
+    "fetch_stocktwits_messages",
+    "fetch_reddit_posts",
+}
+
 
 def assert_installed_import(directory: Path) -> None:
     code = """\
@@ -51,10 +72,10 @@ async def check() -> None:
         async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
             await session.initialize()
             tools = await session.list_tools()
-            assert [tool.name for tool in tools.tools] == ["get_capabilities"]
+            assert {tool.name for tool in tools.tools} == EXPECTED_TOOLS
             result = await session.call_tool("get_capabilities", {})
             assert not result.isError
-            assert result.structuredContent["available_tools"] == ["get_capabilities"]
+            assert set(result.structuredContent["available_tools"]) == EXPECTED_TOOLS
             assert result.structuredContent["data_sources"]["fred"]["credential_present"] is False
 
 

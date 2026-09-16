@@ -408,6 +408,27 @@ class PluginTools:
         self._store = store
         self._server_config = deepcopy(server_config if server_config is not None else get_config())
 
+    def public_operations(self) -> tuple[Callable[..., object], ...]:
+        return (
+            self.start_analysis,
+            self.get_analysis,
+            self.get_stock_data,
+            self.get_indicators,
+            self.get_verified_market_snapshot,
+            self.get_fundamentals,
+            self.get_balance_sheet,
+            self.get_cashflow,
+            self.get_income_statement,
+            self.resolve_instrument_identity,
+            self.get_news,
+            self.get_global_news,
+            self.get_insider_transactions,
+            self.get_macro_indicators,
+            self.get_prediction_markets,
+            self.fetch_stocktwits_messages,
+            self.fetch_reddit_posts,
+        )
+
     def get_stock_data(
         self,
         symbol: str,

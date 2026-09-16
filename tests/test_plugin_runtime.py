@@ -9,6 +9,27 @@ import time
 
 import pytest
 
+EXPECTED_TOOLS = {
+    "get_capabilities",
+    "start_analysis",
+    "get_analysis",
+    "get_stock_data",
+    "get_indicators",
+    "get_verified_market_snapshot",
+    "get_fundamentals",
+    "get_balance_sheet",
+    "get_cashflow",
+    "get_income_statement",
+    "get_news",
+    "get_global_news",
+    "get_insider_transactions",
+    "get_macro_indicators",
+    "get_prediction_markets",
+    "resolve_instrument_identity",
+    "fetch_stocktwits_messages",
+    "fetch_reddit_posts",
+}
+
 
 def test_state_root_is_created_and_probe_removed(tmp_path):
     from tradingagents.plugin.server import prepare_state_root
@@ -183,3 +204,4 @@ def test_stdio_protocol_stdout_is_json_rpc(tmp_path):
     responses = [json.loads(line) for line in stdout_lines]
     assert all(response["jsonrpc"] == "2.0" for response in responses)
     assert [response["id"] for response in responses] == [1, 2]
+    assert {tool["name"] for tool in responses[1]["result"]["tools"]} == EXPECTED_TOOLS
