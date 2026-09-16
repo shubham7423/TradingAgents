@@ -219,12 +219,14 @@ def _validate_date(value: str, name: str) -> str:
 
 
 def _validate_window(
-    start_date: str | None, end_date: str | None
+    start_date: str | None, end_date: str | None, *, optional: bool = False
 ) -> tuple[str | None, str | None]:
+    if start_date is None and end_date is None:
+        if optional:
+            return None, None
+        raise ValueError("start_date and end_date are required")
     if (start_date is None) != (end_date is None):
         raise ValueError("start_date and end_date must be provided together")
-    if start_date is None:
-        return None, None
     start = _validate_date(start_date, "start_date")
     end = _validate_date(end_date, "end_date")
     if start > end:
@@ -795,7 +797,7 @@ class PluginTools:
     ) -> DataToolResult:
         ticker = _validate_ticker(ticker)
         limit = _validate_limit(limit, "limit")
-        start_date, end_date = _validate_window(start_date, end_date)
+        start_date, end_date = _validate_window(start_date, end_date, optional=True)
         arguments = {
             "ticker": ticker,
             "limit": limit,
@@ -831,7 +833,7 @@ class PluginTools:
     ) -> DataToolResult:
         ticker = _validate_ticker(ticker)
         limit_per_sub = _validate_limit(limit_per_sub, "limit_per_sub")
-        start_date, end_date = _validate_window(start_date, end_date)
+        start_date, end_date = _validate_window(start_date, end_date, optional=True)
         arguments = {
             "ticker": ticker,
             "limit_per_sub": limit_per_sub,

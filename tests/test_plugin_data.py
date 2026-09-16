@@ -1049,6 +1049,29 @@ def test_public_method_validation_precedes_fetch(tools, monkeypatch):
         tools.fetch_stocktwits_messages("AAPL", 101)
 
 
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("get_stock_data", ("AAPL", None, None)),
+        ("get_news", ("AAPL", None, None)),
+    ],
+)
+def test_required_date_windows_reject_missing_dates_before_fetch(
+    tools, monkeypatch, method_name, args
+):
+    calls = []
+    monkeypatch.setattr(
+        data,
+        "route_to_vendor_traced",
+        lambda *route_args: calls.append(route_args),
+    )
+
+    with pytest.raises(ValueError, match="start_date and end_date are required"):
+        getattr(tools, method_name)(*args)
+
+    assert calls == []
+
+
 def test_status_reuse_and_continuation_do_not_construct_llm_or_call_network(
     tools, store, monkeypatch
 ):
