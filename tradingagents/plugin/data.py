@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import re
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import date, datetime, timezone
+from threading import Lock
 from typing import Literal
 from uuid import UUID
 
@@ -14,17 +18,18 @@ from tradingagents.agents.utils.agent_utils import (
     resolve_instrument_identity,
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
-from tradingagents.dataflows.config import get_config
-from tradingagents.dataflows.interface import TOOLS_CATEGORIES, VENDOR_METHODS
+from tradingagents.dataflows.config import get_config, replace_config
+from tradingagents.dataflows.interface import TOOLS_CATEGORIES, VENDOR_METHODS, VendorRouteResult
 from tradingagents.dataflows.symbol_utils import normalize_symbol
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
-from tradingagents.plugin.store import PluginStore, RunRecord
+from tradingagents.plugin.store import EvidenceRecord, PluginStore, RunRecord
 
 AnalystKey = Literal["market", "social", "news", "fundamentals"]
 AssetType = Literal["stock", "crypto"]
 MAX_ROUNDS = 10
 MAX_PAGE_SIZE = 32_000
+_DATA_LOCK = Lock()
 
 DATA_CONFIG_KEYS = (
     "data_cache_dir",
@@ -36,6 +41,24 @@ DATA_CONFIG_KEYS = (
     "tool_vendors",
 )
 
+STAGE_TOOLS = {
+    "analyst/market": {"get_stock_data", "get_indicators", "get_verified_market_snapshot"},
+    "analyst/social": {"get_news", "fetch_stocktwits_messages", "fetch_reddit_posts"},
+    "analyst/news": {
+        "get_news",
+        "get_global_news",
+        "get_insider_transactions",
+        "get_macro_indicators",
+        "get_prediction_markets",
+    },
+    "analyst/fundamentals": {
+        "get_fundamentals",
+        "get_balance_sheet",
+        "get_cashflow",
+        "get_income_statement",
+    },
+}
+
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -43,6 +66,128 @@ def _canonical_json(value: object) -> str:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
+
+
+def _encode_cursor(evidence_id: str, offset: int) -> str:
+    payload = _canonical_json({"evidence_id": evidence_id, "offset": offset}).encode()
+    return base64.urlsafe_b64encode(payload).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[str, int]:
+    try:
+        raw = base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True)
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) != {"evidence_id", "offset"}:
+            raise ValueError
+        if not isinstance(payload["evidence_id"], str):
+            raise ValueError
+        evidence_id = str(UUID(payload["evidence_id"]))
+        offset = payload["offset"]
+        if type(offset) is not int or offset < 0 or cursor != _encode_cursor(evidence_id, offset):
+            raise ValueError
+    except (UnicodeEncodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid evidence cursor") from exc
+    return evidence_id, offset
+
+
+def _page_size(value: int | None) -> int:
+    if value is None:
+        return MAX_PAGE_SIZE
+    if type(value) is not int or not 1 <= value <= MAX_PAGE_SIZE:
+        raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
+    return value
+
+
+def _serialize_content(content: object) -> tuple[str, Literal["text", "json"]]:
+    if isinstance(content, str):
+        return content, "text"
+    if isinstance(content, (Mapping, list)):
+        return _canonical_json(content), "json"
+    if content is None:
+        return "", "text"
+    return str(content), "text"
+
+
+def _classify_result(
+    result: VendorRouteResult,
+) -> tuple[
+    Literal["success", "no_data", "unavailable", "error"],
+    str,
+    Literal["text", "json"],
+    list[str],
+    bool,
+]:
+    content, content_format = _serialize_content(result.content)
+    status = result.status
+    warnings = list(result.warnings)
+    retryable = result.retryable
+
+    if content.startswith("<Reddit unavailable: every source failed"):
+        status, retryable = "error", True
+    else:
+        failed_sources = re.findall(
+            r"r/[A-Za-z0-9_]+(?=: <unavailable: fetch failed)", content
+        )
+        failed_summary = re.search(r"<unavailable \(fetch failed\): ([^>]+)>", content)
+        if failed_summary:
+            failed_sources.extend(re.findall(r"r/[A-Za-z0-9_]+", failed_summary.group(1)))
+        failed_sources = list(dict.fromkeys(failed_sources))
+        if failed_sources:
+            status, retryable = "success", False
+            warnings.append(f"Reddit sources unavailable: {', '.join(failed_sources)}")
+        elif (
+            content.startswith("NO_DATA_AVAILABLE")
+            or content.startswith("No news found")
+            or content.startswith("No global news found")
+            or content.startswith("No open prediction markets")
+            or content.startswith("<no Reddit posts")
+        ):
+            status, retryable = "no_data", False
+        elif "public stream serves only recent messages" in content:
+            status, retryable = "unavailable", False
+        elif (
+            content.startswith("Error fetching")
+            or "currently unavailable (network error" in content
+            or content.startswith("<stocktwits unavailable")
+        ):
+            status, retryable = "error", True
+
+    return status, content, content_format, warnings, retryable
+
+
+def _page_record(
+    record: EvidenceRecord,
+    *,
+    cursor: str | None,
+    page_size: int | None,
+    reused: bool,
+) -> DataToolResult:
+    size = _page_size(page_size)
+    offset = 0
+    if cursor is not None:
+        evidence_id, offset = _decode_cursor(cursor)
+        if evidence_id != record.evidence_id or offset >= len(record.content):
+            raise ValueError("cursor does not match saved evidence")
+    end = min(offset + size, len(record.content))
+    complete = end == len(record.content)
+    return DataToolResult(
+        status=record.status,
+        content=record.content[offset:end],
+        content_format=record.content_format,
+        source=record.source.get("vendor", "unknown"),
+        warnings=record.warnings,
+        fetched_at=record.fetched_at,
+        reused=reused,
+        retryable=False,
+        evidence_id=record.evidence_id,
+        run_id=record.run_id,
+        stage_id=record.stage_id,
+        page=EvidencePage(
+            cursor=cursor,
+            next_cursor=None if complete else _encode_cursor(record.evidence_id, end),
+            complete=complete,
+        ),
+    )
 
 
 def _parse_date(value: str | None) -> str:
@@ -53,6 +198,33 @@ def _validate_ticker(value: str) -> str:
     trimmed = value.strip()
     safe_ticker_component(trimmed)
     return normalize_symbol(trimmed)
+
+
+def _validate_run_call(run: RunRecord, tool_name: str, arguments: dict) -> None:
+    if run.status != "active":
+        raise ValueError(f"analysis {run.run_id} is not active")
+    if tool_name != "resolve_instrument_identity" and tool_name not in STAGE_TOOLS.get(
+        run.current_stage, set()
+    ):
+        raise ValueError(f"tool {tool_name} is not allowed at stage {run.current_stage}")
+
+    ticker = arguments.get("ticker")
+    if ticker is not None and _validate_ticker(ticker) != run.instrument["canonical_symbol"]:
+        raise ValueError("ticker does not match the analysis instrument")
+
+    analysis_date = date.fromisoformat(run.normalized_inputs["analysis_date"])
+    curr_date = arguments.get("curr_date")
+    if curr_date is not None and date.fromisoformat(curr_date) != analysis_date:
+        raise ValueError("curr_date must match the analysis date")
+
+    start_value = arguments.get("start_date")
+    end_value = arguments.get("end_date")
+    start_date = date.fromisoformat(start_value) if start_value is not None else None
+    end_date = date.fromisoformat(end_value) if end_value is not None else None
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+    if end_date is not None and end_date > analysis_date:
+        raise ValueError("end_date must not be after the analysis date")
 
 
 def _vendor_chain(value: str, available: set[str]) -> str:
@@ -135,6 +307,31 @@ class EvidenceMetadata(BaseModel):
     warnings: list[str]
 
 
+class EvidencePage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cursor: str | None = None
+    next_cursor: str | None = None
+    complete: bool
+
+
+class DataToolResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["success", "no_data", "unavailable", "error"]
+    content: str
+    content_format: Literal["text", "json"]
+    source: str
+    warnings: list[str]
+    fetched_at: str
+    reused: bool
+    retryable: bool
+    evidence_id: str | None = None
+    run_id: str | None = None
+    stage_id: str | None = None
+    page: EvidencePage
+
+
 class AnalysisResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -158,6 +355,113 @@ class PluginTools:
     def __init__(self, store: PluginStore, server_config: dict | None = None):
         self._store = store
         self._server_config = deepcopy(server_config if server_config is not None else get_config())
+
+    def _execute(
+        self,
+        tool_name: str,
+        arguments: dict,
+        requested_window: dict,
+        fetch: Callable[[], VendorRouteResult],
+        run_id: str | None,
+        cursor: str | None,
+        page_size: int | None,
+    ) -> DataToolResult:
+        if run_id is None:
+            if cursor is not None or page_size is not None:
+                raise ValueError("standalone calls do not support cursor or page_size")
+            with _DATA_LOCK:
+                routed = fetch()
+            status, content, content_format, warnings, retryable = _classify_result(routed)
+            return DataToolResult(
+                status=status,
+                content=content,
+                content_format=content_format,
+                source=routed.source or "unknown",
+                warnings=warnings,
+                fetched_at=datetime.now(timezone.utc).isoformat(),
+                reused=False,
+                retryable=retryable,
+                page=EvidencePage(complete=True),
+            )
+
+        run = self._store.get_run(run_id)
+        _validate_run_call(run, tool_name, arguments)
+        if tool_name == "resolve_instrument_identity":
+            if cursor is not None or page_size is not None:
+                raise ValueError("instrument identity does not support cursor or page_size")
+            content, content_format = _serialize_content(run.instrument)
+            return DataToolResult(
+                status="success",
+                content=content,
+                content_format=content_format,
+                source=run.instrument.get("source", "unknown"),
+                warnings=[],
+                fetched_at=run.created_at,
+                reused=True,
+                retryable=False,
+                run_id=run.run_id,
+                stage_id=run.current_stage,
+                page=EvidencePage(complete=True),
+            )
+
+        _page_size(page_size)
+        if cursor is not None:
+            _decode_cursor(cursor)
+        argument_hash = _digest(arguments)
+        existing = self._store.find_evidence(
+            run.run_id, run.current_stage, tool_name, argument_hash
+        )
+        if existing is not None:
+            return _page_record(existing, cursor=cursor, page_size=page_size, reused=True)
+        if cursor is not None:
+            raise ValueError("cursor does not match saved evidence")
+
+        with _DATA_LOCK:
+            existing = self._store.find_evidence(
+                run.run_id, run.current_stage, tool_name, argument_hash
+            )
+            if existing is not None:
+                return _page_record(existing, cursor=None, page_size=page_size, reused=True)
+
+            previous_config = get_config()
+            replace_config(run.frozen_config)
+            try:
+                routed = fetch()
+            finally:
+                replace_config(previous_config)
+
+            status, content, content_format, warnings, retryable = _classify_result(routed)
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            if status == "error":
+                return DataToolResult(
+                    status=status,
+                    content=content,
+                    content_format=content_format,
+                    source=routed.source or "unknown",
+                    warnings=warnings,
+                    fetched_at=fetched_at,
+                    reused=False,
+                    retryable=retryable,
+                    run_id=run.run_id,
+                    stage_id=run.current_stage,
+                    page=EvidencePage(complete=True),
+                )
+
+            record, created = self._store.save_evidence(
+                run_id=run.run_id,
+                expected_stage=run.current_stage,
+                tool_name=tool_name,
+                argument_hash=argument_hash,
+                arguments=arguments,
+                status=status,
+                fetched_at=fetched_at,
+                requested_window=requested_window,
+                content=content,
+                content_format=content_format,
+                source={"vendor": routed.source or "unknown"},
+                warnings=warnings,
+            )
+            return _page_record(record, cursor=None, page_size=page_size, reused=not created)
 
     def start_analysis(
         self,
