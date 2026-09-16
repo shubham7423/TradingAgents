@@ -292,30 +292,18 @@ def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
     # abort the run.
     if first_traced_error is not None:
         if category in OPTIONAL_CATEGORIES:
-            if first_legacy_error is not None:
-                logger.warning(
-                    "Optional %s unavailable for %s: %s",
-                    category, method, first_legacy_error,
-                )
-                content = (
-                    f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
-                    f"({first_legacy_error}). Proceed without it; do not fabricate values."
-                )
-                return VendorRouteResult(
-                    content=content,
-                    status="unavailable" if only_not_configured else "error",
-                    source=None,
-                    warnings=tuple(warnings),
-                    retryable=not only_not_configured,
-                )
-            legacy_error = RuntimeError(f"No available vendor for '{method}'")
+            error = first_legacy_error or first_traced_error
+            logger.warning("Optional %s unavailable for %s: %s", category, method, error)
+            content = (
+                f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
+                f"({error}). Proceed without it; do not fabricate values."
+            )
             return VendorRouteResult(
-                content=None,
-                status="error",
+                content=content,
+                status="unavailable" if only_not_configured else "error",
                 source=None,
                 warnings=tuple(warnings),
-                retryable=True,
-                legacy_error=legacy_error,
+                retryable=not only_not_configured,
             )
         if only_not_configured:
             return VendorRouteResult(

@@ -204,6 +204,21 @@ class VendorRoutingTests(unittest.TestCase):
         self.assertIs(traced.legacy_error, later_error)
         self.assertIs(ctx.exception, later_error)
 
+    def test_trace_optional_rate_limit_only_keeps_legacy_sentinel(self):
+        rate_limit = interface.VendorRateLimitError("slow down")
+        set_config({"data_vendors": {"macro_data": "fred"}})
+        with self._route_method("get_macro_indicators", {"fred": _raises(rate_limit)}):
+            traced = interface.route_to_vendor_traced(
+                "get_macro_indicators", "cpi", "2026-01-01"
+            )
+            legacy = interface.route_to_vendor("get_macro_indicators", "cpi", "2026-01-01")
+
+        self.assertEqual(traced.status, "error")
+        self.assertTrue(traced.retryable)
+        self.assertIn("DATA_UNAVAILABLE", traced.content)
+        self.assertIsNone(traced.legacy_error)
+        self.assertEqual(legacy, traced.content)
+
 
 if __name__ == "__main__":
     unittest.main()
