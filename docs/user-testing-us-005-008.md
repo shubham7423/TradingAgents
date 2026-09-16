@@ -1,7 +1,6 @@
 # User testing US-005–US-008
 
-Use this checklist after US-005–US-008 have been implemented. At the time this document was
-written, those stories have an approved design but are not yet available in the runtime.
+Use this checklist to verify the implemented US-005–US-008 runtime.
 
 This milestone exposes data and creates the first analyst stage. It does not run or advance a
 complete analysis; stage submission arrives in US-009.
@@ -57,7 +56,8 @@ Ask Codex:
 Pass when:
 
 - `start_analysis`, `get_analysis`, and all fifteen data/identity tools are available.
-- Credential fields contain presence booleans only.
+- Each data source's `credential_present` field is a boolean or `null`; no credential value is
+  returned.
 - API-runner model settings are described as unrelated to the Codex plugin path.
 - No decision-history, stage-submission, finalization, or reflection tool is claimed available.
 
@@ -77,15 +77,17 @@ Each response should have `run_id=null`, `evidence_id=null`, and `reused=false`.
 
 Ask Codex:
 
-> Call TradingAgents `get_verified_market_snapshot` for AAPL using today's local date. This is a
-> standalone call. Show status, source, warnings, and whether the page is complete.
+> Call TradingAgents `get_verified_market_snapshot` as a standalone call with `symbol="AAPL"` and
+> `curr_date="YYYY-MM-DD"` set to today's local date. Show `status`, `retryable`, `source`,
+> `warnings`, and `page.complete`.
 
 Then ask for one contextual source, such as ticker news or a macro indicator. Pass when:
 
 - The response uses the common envelope.
-- `status` clearly distinguishes success, no data, unavailable, and retryable error.
+- `status` is `success`, `no_data`, or `unavailable` for terminal outcomes; a transient failure
+  has `status="error"` and `retryable=true`.
 - Source content is returned without an LLM-generated replacement.
-- Standalone responses are complete and have no evidence ID.
+- Standalone responses have `page.complete=true` and `evidence_id=null`.
 - Missing FRED configuration reports unavailable rather than inventing macro data.
 
 Do not treat live-source availability as a deterministic pass condition. A rate limit or network
@@ -101,40 +103,41 @@ python -c 'import uuid; print(uuid.uuid4())'
 
 Copy it into this request to Codex:
 
-> Call TradingAgents `start_analysis` for AAPL. Omit the analysis date so the server resolves the
-> host-local date. Use asset type `stock`, analysts `["market"]`, one research round, one risk
-> round, English, no vendor overrides, and request ID `<PASTE_UUID>`. Show the complete result.
+> Call TradingAgents `start_analysis` with `ticker="AAPL"`, `asset_type="stock"`,
+> `analysts=["market"]`, `research_rounds=1`, `risk_rounds=1`, `output_language="English"`,
+> `vendor_overrides={}`, and `request_id="<PASTE_UUID>"`. Omit `analysis_date` so the server
+> resolves the host-local date. Show the complete result.
 
 Pass when:
 
-- The echoed date is the host-local calendar date.
-- Status is `active`, revision is `1`, and current stage is `analyst/market`.
-- The response contains a run UUID, frozen configuration, instrument identity, and frozen lessons.
-- No LLM provider/model setting appears in the frozen plugin configuration.
+- `analysis_date` is the host-local calendar date.
+- `status="active"`, `revision=1`, and `current_stage="analyst/market"`.
+- `run_id` is a UUID, and `frozen_config`, `instrument`, and `lessons` are present.
+- No LLM provider/model setting appears in `frozen_config`.
 
 Copy the returned run UUID, then ask:
 
-> Call TradingAgents `get_analysis` for run `<RUN_UUID>`. Do not call any data source.
+> Call TradingAgents `get_analysis` with `run_id="<RUN_UUID>"`. Do not call any data source.
 
-Pass when the stored status, revision, stage, configuration, identity, and lessons match the
-creation response and the read causes no network activity.
+Pass when the stored `status`, `revision`, `current_stage`, `frozen_config`, `instrument`, and
+`lessons` match the creation response and the read causes no network activity.
 
 ## 6. Test run-bound evidence and reuse
 
-Ask Codex to call `get_verified_market_snapshot` with the run UUID, the frozen canonical ticker,
-and the exact echoed analysis date.
+Ask Codex to call `get_verified_market_snapshot` with `run_id=<RUN_UUID>`, `symbol` set to the
+frozen canonical ticker, and `curr_date` set to the exact echoed `analysis_date`.
 
 Pass when the response contains:
 
-- `run_id=<RUN_UUID>` and stage `analyst/market`.
-- A non-null evidence UUID for a terminal result.
+- `run_id=<RUN_UUID>` and `stage_id="analyst/market"`.
+- A non-null `evidence_id` for a terminal result.
 - `reused=false` on the first terminal call.
 - Explicit source and warnings, using `unknown` rather than guessing when necessary.
 
 Repeat the identical call. Pass when:
 
 - `reused=true`.
-- Evidence UUID, fetch time, status, content, source, and warnings are unchanged.
+- `evidence_id`, `fetched_at`, `status`, `content`, `source`, and `warnings` are unchanged.
 - The source is not fetched again.
 
 Call `get_analysis` again. Its evidence metadata must include the saved record without refetching
@@ -146,8 +149,9 @@ Make a run-bound market-data call likely to return a large range and set `page_s
 
 Pass when:
 
-- A partial response has `complete=false` and a non-null `next_cursor`.
-- Repeating the same run, tool, and domain arguments with that cursor returns the next saved page.
+- A partial response has `page.complete=false` and a non-null `page.next_cursor`.
+- Repeating the same `run_id`, tool, domain arguments, and `page_size` with that cursor returns the
+  next saved page.
 - Joining all pages reconstructs the complete saved content without gaps or overlap.
 - A malformed cursor or a cursor used with different arguments is rejected.
 - Supplying a cursor or page size to a standalone call is rejected.
@@ -197,7 +201,8 @@ Ask Codex to call `get_analysis` with the earlier run UUID and repeat an earlier
 
 Pass when:
 
-- The run retains its status, revision, stage, configuration, identity, and lessons.
+- The run retains its `status`, `revision`, `current_stage`, `frozen_config`, `instrument`, and
+  `lessons`.
 - Evidence metadata and content are unchanged.
 - The repeated evidence call has `reused=true` and does not contact the source.
 
@@ -206,8 +211,13 @@ Pass when:
 Manual testing cannot reliably prove concurrent configuration isolation. Run the focused tests:
 
 ```bash
-pytest tests/test_plugin_data.py tests/test_plugin_store.py \
-  tests/test_plugin_runtime.py tests/test_plugin_capabilities.py -q
+pytest tests/test_dataflows_config.py tests/test_vendor_routing.py \
+  tests/test_vendor_errors.py tests/test_no_data_handling.py \
+  tests/test_plugin_store.py tests/test_plugin_data.py \
+  tests/test_plugin_capabilities.py tests/test_plugin_runtime.py \
+  tests/test_symbol_utils.py tests/test_ticker_symbol_handling.py \
+  tests/test_fred.py tests/test_polymarket.py tests/test_stocktwits_resilience.py \
+  tests/test_reddit_fallback.py tests/test_social_lookahead.py -q
 pytest -q
 ruff check .
 ```
