@@ -1,13 +1,78 @@
+import asyncio
 import builtins
 import contextlib
 import json
 import os
 import selectors
+import sqlite3
 import subprocess
 import sys
 import time
 
 import pytest
+
+EXPECTED_TOOLS = {
+    "get_capabilities",
+    "start_analysis",
+    "get_analysis",
+    "get_stock_data",
+    "get_indicators",
+    "get_verified_market_snapshot",
+    "get_fundamentals",
+    "get_balance_sheet",
+    "get_cashflow",
+    "get_income_statement",
+    "get_news",
+    "get_global_news",
+    "get_insider_transactions",
+    "get_macro_indicators",
+    "get_prediction_markets",
+    "resolve_instrument_identity",
+    "fetch_stocktwits_messages",
+    "fetch_reddit_posts",
+}
+
+
+@pytest.mark.parametrize("extra", [
+    {"llm_provider": "openai"},
+    {"memory_log_path": "/tmp/unsupported-memory"},
+    {"analyst": ["news"]},
+])
+def test_sdk_rejects_unknown_start_arguments_before_side_effects(tmp_path, monkeypatch, extra):
+    pytest.importorskip("mcp")
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from tradingagents.plugin import data
+    from tradingagents.plugin.server import create_server
+
+    calls = []
+    monkeypatch.setattr(data, "resolve_instrument_identity", lambda ticker: calls.append(ticker) or {})
+    monkeypatch.setattr(data.TradingMemoryLog, "get_past_context", lambda *args, **kwargs: "")
+    server = create_server(tmp_path)
+    arguments = {
+        "request_id": "11111111-1111-4111-8111-111111111111",
+        "ticker": "AAPL", "analysis_date": "2026-09-15", **extra,
+    }
+
+    async def invoke():
+        async with create_connected_server_and_client_session(server) as client:
+            return await client.call_tool("start_analysis", arguments)
+
+    result = asyncio.run(invoke())
+
+    assert result.isError
+    assert next(iter(extra)) in result.content[0].text
+    assert "Extra inputs are not permitted" in result.content[0].text
+    assert calls == []
+    with sqlite3.connect(tmp_path / "plugin.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+
+    arguments.pop(next(iter(extra)))
+    arguments.update(analysts=["news"], vendor_overrides={"tools": {"get_news": "yfinance"}})
+    accepted = asyncio.run(invoke())
+    assert not accepted.isError
+    assert accepted.structuredContent["current_stage"] == "analyst/news"
+    assert accepted.structuredContent["frozen_config"]["tool_vendors"]["get_news"] == "yfinance"
 
 
 def test_state_root_is_created_and_probe_removed(tmp_path):
@@ -183,3 +248,4 @@ def test_stdio_protocol_stdout_is_json_rpc(tmp_path):
     responses = [json.loads(line) for line in stdout_lines]
     assert all(response["jsonrpc"] == "2.0" for response in responses)
     assert [response["id"] for response in responses] == [1, 2]
+    assert {tool["name"] for tool in responses[1]["result"]["tools"]} == EXPECTED_TOOLS

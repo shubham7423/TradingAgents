@@ -1,10 +1,31 @@
+import asyncio
 import importlib
 import os
 import subprocess
 import sys
-from types import ModuleType
 
 import pytest
+
+EXPECTED_TOOLS = {
+    "get_capabilities",
+    "start_analysis",
+    "get_analysis",
+    "get_stock_data",
+    "get_indicators",
+    "get_verified_market_snapshot",
+    "get_fundamentals",
+    "get_balance_sheet",
+    "get_cashflow",
+    "get_income_statement",
+    "get_news",
+    "get_global_news",
+    "get_insider_transactions",
+    "get_macro_indicators",
+    "get_prediction_markets",
+    "resolve_instrument_identity",
+    "fetch_stocktwits_messages",
+    "fetch_reddit_posts",
+}
 
 
 def test_credentials_are_presence_only(monkeypatch):
@@ -24,25 +45,8 @@ def test_credentials_are_presence_only(monkeypatch):
     assert result.data_sources["fred"].credential_present is True
     assert result.data_sources["alpha_vantage"].credential_present is False
     assert "secret-sentinel-123" not in result.model_dump_json()
-    assert result.available_tools == ["get_capabilities"]
-    assert result.planned_data_tools == [
-        "get_stock_data",
-        "get_indicators",
-        "get_verified_market_snapshot",
-        "get_fundamentals",
-        "get_balance_sheet",
-        "get_cashflow",
-        "get_income_statement",
-        "get_news",
-        "get_global_news",
-        "get_insider_transactions",
-        "get_macro_indicators",
-        "get_prediction_markets",
-        "resolve_instrument_identity",
-        "fetch_stocktwits_messages",
-        "fetch_reddit_posts",
-        "get_decision_history",
-    ]
+    assert set(result.available_tools) == EXPECTED_TOOLS
+    assert result.planned_data_tools == ["get_decision_history"]
     assert result.api_runner_settings == [
         "llm_provider",
         "deep_think_llm",
@@ -68,10 +72,10 @@ def test_credentials_are_presence_only(monkeypatch):
         and result.data_sources[name].credential_present is None
         for name in ("yfinance", "polymarket", "stocktwits", "reddit")
     )
-    assert result.schema_version == 1
-    assert result.analysis_settings.available is False
+    assert result.schema_version == 2
+    assert result.analysis_settings.available is True
     assert result.analysis_settings.model_dump() == {
-        "available": False,
+        "available": True,
         "asset_types": ["stock", "crypto"],
         "analysts": ["market", "social", "news", "fundamentals"],
         "debate_rounds": 1,
@@ -143,38 +147,34 @@ def test_discovery_does_not_call_network_or_runner(monkeypatch):
     assert get_capabilities().model_dump_json()
 
 
-def test_create_server_registers_capability_tool(monkeypatch):
-    from tradingagents.plugin.server import create_server, get_capabilities
+def test_create_server_registers_public_tools(tmp_path):
+    pytest.importorskip("mcp")
+    from tradingagents.plugin.server import create_server
 
-    registered = []
+    registered = asyncio.run(create_server(tmp_path).list_tools())
 
-    class FakeFastMCP:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def tool(self):
-            return registered.append
-
-    mcp = ModuleType("mcp")
-    server = ModuleType("mcp.server")
-    fastmcp = ModuleType("mcp.server.fastmcp")
-    fastmcp.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp", mcp)
-    monkeypatch.setitem(sys.modules, "mcp.server", server)
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp)
-
-    assert isinstance(create_server(), FakeFastMCP)
-    assert registered == [get_capabilities]
+    assert {tool.name for tool in registered} == EXPECTED_TOOLS
+    assert all(tool.inputSchema["additionalProperties"] is False for tool in registered)
 
 
 def test_discovery_imports_without_runner_or_global_config(tmp_path):
     code = '''\
 import sys
 from tradingagents.plugin.server import get_capabilities
-assert get_capabilities().available_tools == ["get_capabilities"]
+expected_tools = {
+    "get_capabilities", "start_analysis", "get_analysis",
+    "get_stock_data", "get_indicators", "get_verified_market_snapshot",
+    "get_fundamentals", "get_balance_sheet", "get_cashflow", "get_income_statement",
+    "get_news", "get_global_news", "get_insider_transactions",
+    "get_macro_indicators", "get_prediction_markets", "resolve_instrument_identity",
+    "fetch_stocktwits_messages", "fetch_reddit_posts",
+}
+assert set(get_capabilities().available_tools) == expected_tools
 assert "tradingagents.graph.trading_graph" not in sys.modules
 assert "tradingagents.default_config" not in sys.modules
 assert "tradingagents.llm_clients.factory" not in sys.modules
+assert "tradingagents.plugin.data" not in sys.modules
+assert "tradingagents.plugin.store" not in sys.modules
 '''
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)

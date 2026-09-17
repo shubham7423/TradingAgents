@@ -49,7 +49,7 @@ class Capabilities(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runtime_version: str
-    schema_version: int = 1
+    schema_version: int = 2
     mcp_sdk_version: str | None
     available_tools: list[str]
     planned_data_tools: list[str]
@@ -105,8 +105,10 @@ def get_capabilities() -> Capabilities:
     return Capabilities(
         runtime_version=version("tradingagents"),
         mcp_sdk_version=_distribution_version("mcp"),
-        available_tools=["get_capabilities"],
-        planned_data_tools=[
+        available_tools=[
+            "get_capabilities",
+            "start_analysis",
+            "get_analysis",
             "get_stock_data",
             "get_indicators",
             "get_verified_market_snapshot",
@@ -114,18 +116,19 @@ def get_capabilities() -> Capabilities:
             "get_balance_sheet",
             "get_cashflow",
             "get_income_statement",
+            "resolve_instrument_identity",
             "get_news",
             "get_global_news",
             "get_insider_transactions",
             "get_macro_indicators",
             "get_prediction_markets",
-            "resolve_instrument_identity",
             "fetch_stocktwits_messages",
             "fetch_reddit_posts",
-            "get_decision_history",
         ],
+        planned_data_tools=["get_decision_history"],
         roles=roles,
         analysis_settings=AnalysisSettings(
+            available=True,
             asset_types=["stock", "crypto"],
             analysts=list(ANALYST_NODE_SPECS),
         ),
@@ -161,12 +164,24 @@ def prepare_state_root(path: str | Path) -> Path:
     return root
 
 
-def create_server() -> FastMCP:
+def create_server(state_root: str | Path) -> FastMCP:
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.tools import Tool
 
-    server = FastMCP("TradingAgents", log_level="WARNING")
-    server.tool()(get_capabilities)
-    return server
+    from tradingagents.plugin.data import PluginTools
+    from tradingagents.plugin.store import PluginStore
+
+    tools = PluginTools(PluginStore(state_root))
+    registered = []
+    for operation in (get_capabilities, *tools.public_operations()):
+        tool = Tool.from_function(operation)
+        # FastMCP 1.26 generates argument models with extra="ignore" by default.
+        arguments = tool.fn_metadata.arg_model
+        arguments.model_config["extra"] = "forbid"
+        arguments.model_rebuild(force=True)
+        tool.parameters = arguments.model_json_schema(by_alias=True)
+        registered.append(tool)
+    return FastMCP("TradingAgents", log_level="WARNING", tools=registered)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -178,7 +193,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     try:
-        prepare_state_root(args.state_dir)
+        root = prepare_state_root(args.state_dir)
     except OSError as exc:
         print(
             f"Cannot use plugin state directory {args.state_dir}: {exc}. "
@@ -189,7 +204,7 @@ def main(argv: list[str] | None = None) -> None:
 
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
     try:
-        server = create_server()
+        server = create_server(root)
     except ModuleNotFoundError as exc:
         if exc.name != "mcp":
             raise

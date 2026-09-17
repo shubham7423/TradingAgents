@@ -118,6 +118,168 @@ class VendorRoutingTests(unittest.TestCase):
                 self.assertRaises(ValueError):
             interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
 
+    def test_trace_reports_actual_fallback_vendor_and_warning(self):
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
+        with self._route({
+            "yfinance": _raises(RuntimeError("primary failed")),
+            "alpha_vantage": _returns("AV_DATA"),
+        }):
+            traced = interface.route_to_vendor_traced(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+            legacy = interface.route_to_vendor(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+
+        self.assertEqual(traced.content, "AV_DATA")
+        self.assertEqual(traced.status, "success")
+        self.assertEqual(traced.source, "alpha_vantage")
+        self.assertTrue(any("yfinance" in warning for warning in traced.warnings))
+        self.assertEqual(legacy, "AV_DATA")
+
+    def test_trace_classifies_missing_only_vendor_without_changing_legacy_raise(self):
+        missing = interface.VendorNotConfiguredError("missing key")
+        set_config({"data_vendors": {"core_stock_apis": "alpha_vantage"}})
+        with self._route({"alpha_vantage": _raises(missing)}):
+            traced = interface.route_to_vendor_traced(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+            self.assertEqual(traced.status, "unavailable")
+            self.assertFalse(traced.retryable)
+            with self.assertRaises(interface.VendorNotConfiguredError):
+                interface.route_to_vendor(
+                    "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+                )
+
+    def test_trace_classifies_optional_missing_only_as_unavailable(self):
+        missing = interface.VendorNotConfiguredError("missing key")
+        set_config({"data_vendors": {"macro_data": "fred"}})
+        with self._route_method("get_macro_indicators", {"fred": _raises(missing)}):
+            traced = interface.route_to_vendor_traced(
+                "get_macro_indicators", "cpi", "2026-01-01"
+            )
+            legacy = interface.route_to_vendor("get_macro_indicators", "cpi", "2026-01-01")
+
+        self.assertEqual(traced.status, "unavailable")
+        self.assertFalse(traced.retryable)
+        self.assertIn("DATA_UNAVAILABLE", traced.content)
+        self.assertIsNone(traced.legacy_error)
+        self.assertEqual(legacy, traced.content)
+
+    def test_trace_sole_rate_limit_preserves_legacy_runtime_error(self):
+        rate_limit = interface.VendorRateLimitError("slow down")
+        set_config({"data_vendors": {"core_stock_apis": "yfinance"}})
+        with self._route({"yfinance": _raises(rate_limit)}):
+            traced = interface.route_to_vendor_traced(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                interface.route_to_vendor(
+                    "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+                )
+
+        self.assertEqual(traced.status, "error")
+        self.assertTrue(traced.retryable)
+        self.assertIsInstance(traced.legacy_error, RuntimeError)
+        self.assertNotIsInstance(ctx.exception, interface.VendorRateLimitError)
+
+    def test_trace_rate_limit_before_later_error_preserves_later_legacy_error(self):
+        rate_limit = interface.VendorRateLimitError("slow down")
+        later_error = RuntimeError("fallback failed")
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
+        with self._route({
+            "yfinance": _raises(rate_limit),
+            "alpha_vantage": _raises(later_error),
+        }):
+            traced = interface.route_to_vendor_traced(
+                "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                interface.route_to_vendor(
+                    "get_stock_data", "AAPL", "2026-01-01", "2026-01-10"
+                )
+
+        self.assertEqual(traced.status, "error")
+        self.assertTrue(traced.retryable)
+        self.assertIs(traced.legacy_error, later_error)
+        self.assertIs(ctx.exception, later_error)
+
+    def test_trace_optional_rate_limit_only_preserves_legacy_runtime_error(self):
+        rate_limit = interface.VendorRateLimitError("slow down")
+        set_config({"data_vendors": {"macro_data": "fred"}})
+        with self._route_method("get_macro_indicators", {"fred": _raises(rate_limit)}):
+            traced = interface.route_to_vendor_traced(
+                "get_macro_indicators", "cpi", "2026-01-01"
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                interface.route_to_vendor("get_macro_indicators", "cpi", "2026-01-01")
+
+        self.assertEqual(traced.status, "error")
+        self.assertTrue(traced.retryable)
+        self.assertIn("DATA_UNAVAILABLE", traced.content)
+        self.assertIs(type(ctx.exception), RuntimeError)
+        self.assertEqual(str(ctx.exception), "No available vendor for 'get_macro_indicators'")
+        self.assertIs(type(traced.legacy_error), RuntimeError)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("request failed: https://www.alphavantage.co/query?apikey=secret-token"),
+        interface.VendorRateLimitError("request failed: apikey=secret-token"),
+        interface.VendorNotConfiguredError("invalid key: secret-token"),
+        NoMarketDataError("AAPL", detail="request failed: secret-token"),
+    ],
+)
+def test_trace_warnings_do_not_copy_exception_text(monkeypatch, error):
+    set_config({"tool_vendors": {"get_stock_data": "alpha_vantage,yfinance"}})
+    monkeypatch.setitem(interface.VENDOR_METHODS, "get_stock_data", {
+        "alpha_vantage": _raises(error), "yfinance": _returns("prices"),
+    })
+
+    traced = interface.route_to_vendor_traced("get_stock_data", "AAPL", "2026-09-01", "2026-09-15")
+
+    assert traced.status == "success"
+    assert traced.source == "yfinance"
+    assert "secret-token" not in str(traced.warnings)
+    assert "https://" not in str(traced.warnings)
+    assert "alpha_vantage" in traced.warnings[0]
+    assert type(error).__name__ in traced.warnings[0]
+
+
+def test_trace_sanitizes_failure_without_changing_legacy_exception(monkeypatch):
+    error = RuntimeError("https://www.alphavantage.co/query?apikey=secret-token")
+    set_config({"tool_vendors": {"get_stock_data": "alpha_vantage"}})
+    monkeypatch.setitem(interface.VENDOR_METHODS, "get_stock_data", {"alpha_vantage": _raises(error)})
+
+    traced = interface.route_to_vendor_traced("get_stock_data", "AAPL", "2026-09-01", "2026-09-15")
+    with pytest.raises(RuntimeError) as raised:
+        interface.route_to_vendor("get_stock_data", "AAPL", "2026-09-01", "2026-09-15")
+
+    assert raised.value is error
+    assert traced.legacy_error is error
+    assert "secret-token" not in str(traced.warnings)
+
+
+@pytest.mark.parametrize("first_is_rate_limit", [False, True])
+def test_optional_mixed_failures_preserve_legacy_sentinel(monkeypatch, first_is_rate_limit):
+    errors = [interface.VendorRateLimitError("slow down"), ValueError("bad series")]
+    if not first_is_rate_limit:
+        errors.reverse()
+    set_config({"tool_vendors": {"get_macro_indicators": "fred,other"}})
+    monkeypatch.setitem(interface.VENDOR_METHODS, "get_macro_indicators", {
+        "fred": _raises(errors[0]), "other": _raises(errors[1]),
+    })
+
+    traced = interface.route_to_vendor_traced("get_macro_indicators", "cpi", "2026-09-15")
+    legacy = interface.route_to_vendor("get_macro_indicators", "cpi", "2026-09-15")
+
+    assert traced.status == "error" and traced.retryable
+    assert legacy == (
+        "DATA_UNAVAILABLE: optional macro_data could not be retrieved "
+        "(bad series). Proceed without it; do not fabricate values."
+    )
+
 
 if __name__ == "__main__":
     unittest.main()

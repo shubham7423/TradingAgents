@@ -6,7 +6,7 @@ import unittest
 import pytest
 
 import tradingagents.default_config as default_config
-from tradingagents.dataflows.config import get_config, set_config
+from tradingagents.dataflows.config import get_config, replace_config, set_config
 
 
 @pytest.mark.unit
@@ -59,3 +59,18 @@ class DataflowsConfigIsolationTests(unittest.TestCase):
         fresh = get_config()
         self.assertEqual(fresh["tool_vendors"]["get_stock_data"], "alpha_vantage")
         self.assertEqual(fresh["tool_vendors"]["get_news"], "alpha_vantage")
+
+    def test_replace_config_clears_stale_nested_keys(self):
+        set_config({"tool_vendors": {"get_news": "alpha_vantage"}})
+        replacement = {"data_vendors": {"news_data": "yfinance"}, "tool_vendors": {}}
+
+        replace_config(replacement)
+        replacement["data_vendors"]["news_data"] = "alpha_vantage"
+
+        self.assertEqual(
+            get_config(),
+            {
+                "data_vendors": {"news_data": "yfinance"},
+                "tool_vendors": {},
+            },
+        )

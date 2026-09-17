@@ -1,4 +1,9 @@
 import logging
+import os
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Literal
 
 from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
@@ -31,6 +36,40 @@ from .y_finance import (
 from .yfinance_news import get_global_news_yfinance, get_news_yfinance
 
 logger = logging.getLogger(__name__)
+
+_DIAGNOSTIC_URL = re.compile(r"\b(?:https?|ftp)://[^\s<>\"']+")
+_DIAGNOSTIC_CREDENTIAL = re.compile(
+    r"(?i)(\b(?:api[_ -]?key|apikey|access[_ -]?token|auth(?:orization)?|"
+    r"password|secret|credential)\b\s*[:=]\s*|\b(?:bearer|basic)\s+)"
+    r"[^\s,;\)\]}]+"
+)
+_DIAGNOSTIC_BARE_SECRET = re.compile(
+    r"(?i)\b(?:secret|token|password|credential)[-_][A-Za-z0-9._~-]+\b"
+)
+
+
+def sanitize_diagnostic(value: object) -> str:
+    """Remove credentials and URLs from text exposed as a vendor diagnostic."""
+    text = str(value)
+    for name, secret in os.environ.items():
+        if secret and any(
+            marker in name.upper()
+            for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
+        ):
+            text = text.replace(secret, "[redacted]")
+    text = _DIAGNOSTIC_URL.sub("[redacted URL]", text)
+    text = _DIAGNOSTIC_CREDENTIAL.sub(r"\1[redacted]", text)
+    return _DIAGNOSTIC_BARE_SECRET.sub("[redacted]", text)
+
+
+@dataclass(frozen=True)
+class VendorRouteResult:
+    content: object
+    status: Literal["success", "no_data", "unavailable", "error"]
+    source: str | None
+    warnings: Sequence[str] = ()
+    retryable: bool = False
+    legacy_error: Exception | None = field(default=None, repr=False, compare=False)
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -165,7 +204,7 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
-def route_to_vendor(method: str, *args, **kwargs):
+def route_to_vendor_traced(method: str, *args, **kwargs) -> VendorRouteResult:
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
@@ -193,31 +232,53 @@ def route_to_vendor(method: str, *args, **kwargs):
         vendor_chain = all_available_vendors
 
     last_no_data: NoMarketDataError | None = None
-    first_error: Exception | None = None
+    first_traced_error: Exception | None = None
+    first_legacy_error: Exception | None = None
+    warnings: list[str] = []
+    only_not_configured = True
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
-        except VendorRateLimitError:
+            return VendorRouteResult(
+                content=impl_func(*args, **kwargs),
+                status="success",
+                source=vendor,
+                warnings=tuple(warnings),
+            )
+        except VendorRateLimitError as e:
+            warnings.append(f"{vendor}: {type(e).__name__}: {sanitize_diagnostic(e)}")
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
+            only_not_configured = False
+            if first_traced_error is None:
+                first_traced_error = e
             continue
         except VendorNotConfiguredError as e:
+            warnings.append(f"{vendor}: {type(e).__name__}: {sanitize_diagnostic(e)}")
+            only_not_configured = only_not_configured and not e.authentication_failed
             logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
-            if first_error is None:
-                first_error = e  # Surface it if no other vendor can serve the call.
+            if first_traced_error is None:
+                first_traced_error = e
+            if first_legacy_error is None:
+                first_legacy_error = e  # Surface it if no other vendor can serve the call.
             continue
         except NoMarketDataError as e:
+            warnings.append(f"{vendor}: {type(e).__name__}")
             last_no_data = e  # No data here; another configured vendor may have it
+            only_not_configured = False
             continue
         except Exception as e:
+            warnings.append(f"{vendor}: {type(e).__name__}: {sanitize_diagnostic(e)}")
             # Don't let one vendor's failure crash the call when another can
             # serve it, but never swallow silently: a broken primary must be
             # visible in the logs (#989), not hidden behind a fallback's verdict.
             logger.warning("Vendor %r failed for %s: %s", vendor, method, e)
-            if first_error is None:
-                first_error = e
+            if first_traced_error is None:
+                first_traced_error = e
+            if first_legacy_error is None:
+                first_legacy_error = e
+            only_not_configured = False
             continue
 
     # If any vendor reported "no data", the symbol is genuinely unavailable.
@@ -225,12 +286,12 @@ def route_to_vendor(method: str, *args, **kwargs):
     # empty string, so the agent reports "unavailable" instead of inventing a
     # value. This takes precedence over incidental fallback errors.
     if last_no_data is not None:
-        if first_error is not None:
+        if first_legacy_error is not None:
             # A vendor also hit a real error; surface it in logs so the no-data
             # verdict can't hide a broken primary (network/auth/etc.).
             logger.warning(
                 "Returning NO_DATA for %s, but a vendor errored earlier: %s",
-                method, first_error,
+                method, sanitize_diagnostic(first_legacy_error),
             )
         sym = last_no_data.symbol
         canonical = last_no_data.canonical
@@ -238,25 +299,67 @@ def route_to_vendor(method: str, *args, **kwargs):
         # Surface the typed error's detail (e.g. "latest row is 2025-06-11 ...
         # stale") so the agent sees the specific reason — invalid symbol, no
         # coverage, or stale data — not just a generic "unavailable".
-        reason = f" ({last_no_data.detail})" if last_no_data.detail else ""
-        return (
+        reason = f" ({sanitize_diagnostic(last_no_data.detail)})" if last_no_data.detail else ""
+        content = (
             f"NO_DATA_AVAILABLE: No usable market data for '{sym}'{resolved} from "
             f"any configured vendor{reason}. The symbol may be invalid, delisted, "
             f"not covered, or the vendor returned stale data. Do not estimate or "
             f"fabricate values — report that data is unavailable for this symbol."
+        )
+        return VendorRouteResult(
+            content=content,
+            status="no_data",
+            source=None,
+            warnings=tuple(warnings),
         )
 
     # No vendor returned data and none reported clean "no data" — surface the
     # first real error (e.g. the primary vendor's network failure). Optional
     # enrichment categories degrade to a sentinel instead, so flavour data can't
     # abort the run.
-    if first_error is not None:
+    if first_traced_error is not None:
         if category in OPTIONAL_CATEGORIES:
-            logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
-            return (
+            error = first_legacy_error or first_traced_error
+            error_text = sanitize_diagnostic(error)
+            logger.warning("Optional %s unavailable for %s: %s", category, method, error_text)
+            content = (
                 f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
-                f"({first_error}). Proceed without it; do not fabricate values."
+                f"({error_text}). Proceed without it; do not fabricate values."
             )
-        raise first_error
+            return VendorRouteResult(
+                content=content,
+                status="unavailable" if only_not_configured else "error",
+                source=None,
+                warnings=tuple(warnings),
+                retryable=not only_not_configured,
+                legacy_error=(
+                    RuntimeError(f"No available vendor for '{method}'")
+                    if first_legacy_error is None else None
+                ),
+            )
+        if only_not_configured:
+            return VendorRouteResult(
+                content=None,
+                status="unavailable",
+                source=None,
+                warnings=tuple(warnings),
+                legacy_error=first_legacy_error,
+            )
+        legacy_error = first_legacy_error or RuntimeError(f"No available vendor for '{method}'")
+        return VendorRouteResult(
+            content=None,
+            status="error",
+            source=None,
+            warnings=tuple(warnings),
+            retryable=True,
+            legacy_error=legacy_error,
+        )
 
     raise RuntimeError(f"No available vendor for '{method}'")
+
+
+def route_to_vendor(method: str, *args, **kwargs):
+    result = route_to_vendor_traced(method, *args, **kwargs)
+    if result.legacy_error is not None:
+        raise result.legacy_error
+    return result.content

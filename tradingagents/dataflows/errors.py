@@ -53,3 +53,8 @@ class VendorNotConfiguredError(VendorError, ValueError):
     Also a ``ValueError`` so existing callers that catch ``ValueError`` keep
     working while the routing layer can treat it as "vendor unavailable".
     """
+
+    def __init__(self, *args, authentication_failed: bool = False):
+        super().__init__(*args)
+        # Some legacy adapters also raise this type for a rejected configured key.
+        self.authentication_failed = authentication_failed

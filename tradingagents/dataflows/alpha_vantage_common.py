@@ -95,19 +95,31 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
     except json.JSONDecodeError:
         return response_text
 
-    # Alpha Vantage reports problems via "Information" / "Note". Classify so a
+    # Alpha Vantage reports problems via these diagnostic fields. Classify so a
     # genuine rate limit and an invalid/missing key aren't conflated (#991):
     # rate-limit phrasing is checked first because those notices also mention
     # "API key" ("your API key ... 25 requests per day").
-    notice = response_json.get("Information") or response_json.get("Note")
-    if notice:
+    notices = [
+        str(response_json[field])
+        for field in ("Information", "Note", "Error Message")
+        if response_json.get(field)
+    ]
+    for notice in notices:
         low = notice.lower()
         if any(m in low for m in ("rate limit", "requests per day", "call frequency", "premium")):
             raise AlphaVantageRateLimitError(f"Alpha Vantage rate limit exceeded: {notice}")
-        if "api key" in low or "apikey" in low:
-            # Reuse the existing "not configured" error so a bad key surfaces as
-            # a real, actionable failure rather than a mislabeled rate limit (#991).
-            raise AlphaVantageNotConfiguredError(f"Alpha Vantage API key invalid or missing: {notice}")
+    for notice in notices:
+        low = notice.lower()
+        if (
+            ("api key" in low or "apikey" in low)
+            and any(word in low for word in ("invalid", "missing", "expired", "unauthorized"))
+        ):
+            # Reuse the existing error type so a bad key stays a ValueError for
+            # legacy callers while the router can mark it retryable (#991).
+            raise AlphaVantageNotConfiguredError(
+                f"Alpha Vantage API key invalid or missing: {notice}",
+                authentication_failed=True,
+            )
 
     return response_text
 
