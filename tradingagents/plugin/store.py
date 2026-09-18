@@ -174,8 +174,8 @@ class PluginStore:
             metadata_exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
             ).fetchone()
-            connection.execute("PRAGMA journal_mode=WAL")
             if not metadata_exists:
+                connection.execute("PRAGMA journal_mode=WAL")
                 self._create_schema(connection)
                 return
 
@@ -183,13 +183,14 @@ class PluginStore:
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()
             version = None if row is None else row["value"]
-            if version == "1":
-                self._migrate_v1(connection)
-            elif version != str(SCHEMA_VERSION):
+            if version not in {"1", str(SCHEMA_VERSION)}:
                 raise IncompatibleState(
                     "INCOMPATIBLE_STATE: database schema "
                     f"{version} is not supported; expected {SCHEMA_VERSION}"
                 )
+            connection.execute("PRAGMA journal_mode=WAL")
+            if version == "1":
+                self._migrate_v1(connection)
 
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.executescript(

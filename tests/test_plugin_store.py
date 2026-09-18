@@ -153,9 +153,11 @@ def test_invalid_evidence_status_is_rejected_without_persistence(tmp_path):
 
 
 def test_incompatible_schema_is_rejected_without_mutation(tmp_path):
-    store = PluginStore(tmp_path)
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute("UPDATE metadata SET value = '999' WHERE key = 'schema_version'")
+    database = tmp_path / "plugin.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("INSERT INTO metadata VALUES ('schema_version', '999')")
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
 
     with pytest.raises(
         IncompatibleState,
@@ -163,11 +165,12 @@ def test_incompatible_schema_is_rejected_without_mutation(tmp_path):
     ):
         PluginStore(tmp_path)
 
-    with sqlite3.connect(store.database_path) as connection:
+    with sqlite3.connect(database) as connection:
         value = connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert value == "999"
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    assert (value, journal_mode) == ("999", "delete")
 
 
 def test_v1_database_migrates_without_losing_run_or_evidence(tmp_path):
