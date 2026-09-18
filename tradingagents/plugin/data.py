@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -34,7 +33,13 @@ from tradingagents.dataflows.stocktwits import (
 from tradingagents.dataflows.symbol_utils import NoMarketDataError, crypto_base, normalize_symbol
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
-from tradingagents.plugin.store import EvidenceRecord, PluginStore, RunRecord
+from tradingagents.plugin.store import (
+    EvidenceRecord,
+    PluginStore,
+    RunRecord,
+    canonical_json,
+    digest_json,
+)
 
 AnalystKey = Literal["market", "social", "news", "fundamentals"]
 AssetType = Literal["stock", "crypto"]
@@ -72,16 +77,8 @@ STAGE_TOOLS = {
 }
 
 
-def _canonical_json(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def _digest(value: object) -> str:
-    return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
-
-
 def _encode_cursor(evidence_id: str, offset: int) -> str:
-    payload = _canonical_json({"evidence_id": evidence_id, "offset": offset}).encode()
+    payload = canonical_json({"evidence_id": evidence_id, "offset": offset}).encode()
     return base64.urlsafe_b64encode(payload).decode()
 
 
@@ -114,7 +111,7 @@ def _serialize_content(content: object) -> tuple[str, Literal["text", "json"]]:
     if isinstance(content, str):
         return content, "text"
     if isinstance(content, (Mapping, list)):
-        return _canonical_json(content), "json"
+        return canonical_json(content), "json"
     if content is None:
         return "", "text"
     return str(content), "text"
@@ -955,7 +952,7 @@ class PluginTools:
         _page_size(page_size)
         if cursor is not None:
             _decode_cursor(cursor)
-        argument_hash = _digest(arguments)
+        argument_hash = digest_json(arguments)
         existing = self._store.find_evidence(
             run.run_id, run.current_stage, tool_name, argument_hash
         )
@@ -1078,7 +1075,7 @@ class PluginTools:
 
         record, _ = self._store.create_run(
             request_id=request.request_id,
-            request_hash=_digest(fingerprint),
+            request_hash=digest_json(fingerprint),
             normalized_inputs=normalized_inputs,
             current_stage=f"analyst/{request.analysts[0]}",
             frozen_config=frozen_config,

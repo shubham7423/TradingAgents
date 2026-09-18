@@ -8,7 +8,12 @@ from pydantic import ValidationError
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.interface import VendorRouteResult
 from tradingagents.plugin import data
-from tradingagents.plugin.store import PluginStore, RequestIdConflict
+from tradingagents.plugin.store import (
+    PluginStore,
+    RequestIdConflict,
+    canonical_json,
+    digest_json,
+)
 
 REQUEST_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -310,8 +315,8 @@ def test_canonical_digest_ignores_mapping_order():
     left = {"ticker": "AAPL", "options": {"b": 2, "a": 1}}
     right = {"options": {"a": 1, "b": 2}, "ticker": "AAPL"}
 
-    assert data._canonical_json(left) == data._canonical_json(right)
-    assert data._digest(left) == data._digest(right)
+    assert canonical_json(left) == canonical_json(right)
+    assert digest_json(left) == digest_json(right)
 
 
 def test_execute_reuses_terminal_evidence(tools, store):
@@ -1087,7 +1092,7 @@ def test_status_reuse_and_continuation_do_not_construct_llm_or_call_network(
         run_id=run.run_id,
         expected_stage=run.current_stage,
         tool_name="get_stock_data",
-        argument_hash=data._digest(arguments),
+        argument_hash=digest_json(arguments),
         arguments=arguments,
         status="success",
         fetched_at="2026-09-15T12:01:00+00:00",

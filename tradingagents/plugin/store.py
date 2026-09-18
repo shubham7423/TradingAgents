@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class RequestIdConflict(RuntimeError):
@@ -31,6 +33,7 @@ class RunRecord:
     request_id: str
     request_hash: str
     normalized_inputs: dict
+    ticker: str
     status: str
     revision: int
     current_stage: str
@@ -60,8 +63,39 @@ class EvidenceRecord:
     warnings: list[str]
 
 
-def _json(value: object) -> str:
+@dataclass(frozen=True)
+class StageOutputRecord:
+    receipt_id: str
+    run_id: str
+    stage_id: str
+    role_key: str
+    output_kind: Literal["text", "structured"]
+    canonical_output: object
+    rendered_output: str
+    output_hash: str
+    accepted_revision: int
+    accepted_at: str
+
+
+@dataclass(frozen=True)
+class AnalysisSnapshot:
+    run: RunRecord
+    outputs: list[StageOutputRecord]
+    evidence: list[EvidenceRecord]
+
+
+@dataclass(frozen=True)
+class EvidenceRequirement:
+    tool_name: str
+    arguments: dict[str, object]
+
+
+def canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def digest_json(value: object) -> str:
+    return hashlib.sha256(canonical_json(value).encode()).hexdigest()
 
 
 def _run_record(row: sqlite3.Row) -> RunRecord:
@@ -70,6 +104,7 @@ def _run_record(row: sqlite3.Row) -> RunRecord:
         request_id=row["request_id"],
         request_hash=row["request_hash"],
         normalized_inputs=json.loads(row["normalized_inputs_json"]),
+        ticker=row["ticker"],
         status=row["status"],
         revision=row["revision"],
         current_stage=row["current_stage"],
@@ -101,6 +136,21 @@ def _evidence_record(row: sqlite3.Row) -> EvidenceRecord:
     )
 
 
+def _stage_output_record(row: sqlite3.Row) -> StageOutputRecord:
+    return StageOutputRecord(
+        receipt_id=row["receipt_id"],
+        run_id=row["run_id"],
+        stage_id=row["stage_id"],
+        role_key=row["role_key"],
+        output_kind=row["output_kind"],
+        canonical_output=json.loads(row["canonical_output_json"]),
+        rendered_output=row["rendered_output"],
+        output_hash=row["output_hash"],
+        accepted_revision=row["accepted_revision"],
+        accepted_at=row["accepted_at"],
+    )
+
+
 class PluginStore:
     def __init__(self, state_root: str | Path):
         root = Path(state_root).expanduser().resolve()
@@ -124,63 +174,134 @@ class PluginStore:
             metadata_exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
             ).fetchone()
-            if metadata_exists:
-                row = connection.execute(
-                    "SELECT value FROM metadata WHERE key='schema_version'"
-                ).fetchone()
-                if row is not None and row["value"] != str(SCHEMA_VERSION):
-                    raise IncompatibleState(
-                        "INCOMPATIBLE_STATE: database schema "
-                        f"{row['value']} is not supported; expected {SCHEMA_VERSION}"
-                    )
-
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS runs (
-                    run_id TEXT PRIMARY KEY,
-                    request_id TEXT NOT NULL UNIQUE,
-                    request_hash TEXT NOT NULL,
-                    normalized_inputs_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('active','ready_to_finalize','completed','cancelled')
-                    ),
-                    revision INTEGER NOT NULL,
-                    current_stage TEXT NOT NULL,
-                    frozen_config_json TEXT NOT NULL,
-                    instrument_json TEXT NOT NULL,
-                    lessons TEXT NOT NULL,
-                    state_schema INTEGER NOT NULL,
-                    prompt_schema INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS evidence (
-                    evidence_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL REFERENCES runs(run_id),
-                    stage_id TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    argument_hash TEXT NOT NULL,
-                    arguments_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('success','no_data','unavailable')),
-                    fetched_at TEXT NOT NULL,
-                    requested_window_json TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    content_format TEXT NOT NULL CHECK (content_format IN ('text','json')),
-                    source_json TEXT NOT NULL,
-                    warnings_json TEXT NOT NULL,
-                    UNIQUE (run_id, stage_id, tool_name, argument_hash)
-                );
-                """
+            if not metadata_exists:
+                self._create_schema(connection)
+                return
+
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            version = None if row is None else row["value"]
+            if version == "1":
+                self._migrate_v1(connection)
+            elif version != str(SCHEMA_VERSION):
+                raise IncompatibleState(
+                    "INCOMPATIBLE_STATE: database schema "
+                    f"{version} is not supported; expected {SCHEMA_VERSION}"
+                )
+
+    def _create_schema(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE,
+                request_hash TEXT NOT NULL,
+                normalized_inputs_json TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('active','ready_to_finalize','completed','cancelled')
+                ),
+                revision INTEGER NOT NULL,
+                current_stage TEXT NOT NULL,
+                frozen_config_json TEXT NOT NULL,
+                instrument_json TEXT NOT NULL,
+                lessons TEXT NOT NULL,
+                state_schema INTEGER NOT NULL,
+                prompt_schema INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE evidence (
+                evidence_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                stage_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                argument_hash TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('success','no_data','unavailable')),
+                fetched_at TEXT NOT NULL,
+                requested_window_json TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_format TEXT NOT NULL CHECK (content_format IN ('text','json')),
+                source_json TEXT NOT NULL,
+                warnings_json TEXT NOT NULL,
+                UNIQUE (run_id, stage_id, tool_name, argument_hash)
+            );
+            CREATE TABLE stage_outputs (
+                receipt_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                stage_id TEXT NOT NULL,
+                role_key TEXT NOT NULL,
+                output_kind TEXT NOT NULL CHECK (output_kind IN ('text','structured')),
+                canonical_output_json TEXT NOT NULL,
+                rendered_output TEXT NOT NULL,
+                output_hash TEXT NOT NULL,
+                accepted_revision INTEGER NOT NULL,
+                accepted_at TEXT NOT NULL,
+                UNIQUE (run_id, stage_id)
+            );
+            CREATE INDEX idx_stage_outputs_run_revision
+            ON stage_outputs(run_id, accepted_revision);
+            CREATE INDEX idx_runs_listing
+            ON runs(status, ticker, created_at DESC, run_id DESC);
+            """
+        )
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+
+    def _migrate_v1(self, connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("ALTER TABLE runs ADD COLUMN ticker TEXT")
+        rows = connection.execute("SELECT run_id, normalized_inputs_json FROM runs").fetchall()
+        for row in rows:
+            try:
+                ticker = json.loads(row["normalized_inputs_json"])["ticker"]
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise IncompatibleState(
+                    f"INCOMPATIBLE_STATE: run {row['run_id']} has no valid ticker"
+                ) from exc
+            if not isinstance(ticker, str):
+                raise IncompatibleState(
+                    f"INCOMPATIBLE_STATE: run {row['run_id']} has no valid ticker"
+                )
+            connection.execute("UPDATE runs SET ticker = ? WHERE run_id = ?", (ticker, row["run_id"]))
+        connection.execute(
+            """
+            CREATE TABLE stage_outputs (
+                receipt_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                stage_id TEXT NOT NULL,
+                role_key TEXT NOT NULL,
+                output_kind TEXT NOT NULL CHECK (output_kind IN ('text','structured')),
+                canonical_output_json TEXT NOT NULL,
+                rendered_output TEXT NOT NULL,
+                output_hash TEXT NOT NULL,
+                accepted_revision INTEGER NOT NULL,
+                accepted_at TEXT NOT NULL,
+                UNIQUE (run_id, stage_id)
             )
-            connection.execute(
-                "INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
-            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX idx_stage_outputs_run_revision "
+            "ON stage_outputs(run_id, accepted_revision)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_runs_listing "
+            "ON runs(status, ticker, created_at DESC, run_id DESC)"
+        )
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
 
     def create_run(
         self,
@@ -210,19 +331,20 @@ class PluginStore:
             connection.execute(
                 """
                 INSERT INTO runs (
-                    run_id, request_id, request_hash, normalized_inputs_json, status, revision,
+                    run_id, request_id, request_hash, normalized_inputs_json, ticker, status, revision,
                     current_stage, frozen_config_json, instrument_json, lessons, state_schema,
                     prompt_schema, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, 1, 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, 1, 1, ?, ?)
                 """,
                 (
                     run_id,
                     request_id,
                     request_hash,
-                    _json(normalized_inputs),
+                    canonical_json(normalized_inputs),
+                    normalized_inputs["ticker"],
                     current_stage,
-                    _json(frozen_config),
-                    _json(instrument),
+                    canonical_json(frozen_config),
+                    canonical_json(instrument),
                     lessons,
                     now,
                     now,
@@ -237,6 +359,73 @@ class PluginStore:
         if row is None:
             raise RunNotFound(f"RUN_NOT_FOUND: analysis {run_id} does not exist")
         return _run_record(row)
+
+    def get_snapshot(self, run_id: str) -> AnalysisSnapshot:
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            run = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise RunNotFound(f"RUN_NOT_FOUND: analysis {run_id} does not exist")
+            outputs = connection.execute(
+                "SELECT * FROM stage_outputs WHERE run_id = ? ORDER BY accepted_revision",
+                (run_id,),
+            ).fetchall()
+            evidence = connection.execute(
+                "SELECT * FROM evidence WHERE run_id = ? ORDER BY fetched_at, evidence_id",
+                (run_id,),
+            ).fetchall()
+        return AnalysisSnapshot(
+            _run_record(run),
+            [_stage_output_record(row) for row in outputs],
+            [_evidence_record(row) for row in evidence],
+        )
+
+    def get_stage_output(self, run_id: str, stage_id: str) -> StageOutputRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM stage_outputs WHERE run_id = ? AND stage_id = ?",
+                (run_id, stage_id),
+            ).fetchone()
+        return None if row is None else _stage_output_record(row)
+
+    def get_evidence(self, run_id: str, evidence_id: str) -> EvidenceRecord:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM evidence WHERE run_id = ? AND evidence_id = ?",
+                (run_id, evidence_id),
+            ).fetchone()
+        if row is None:
+            raise RunNotFound(
+                f"RUN_NOT_FOUND: evidence {evidence_id} does not exist in {run_id}"
+            )
+        return _evidence_record(row)
+
+    def list_runs(
+        self,
+        ticker: str | None,
+        status: str | None,
+        limit: int,
+        before: tuple[str, str] | None,
+    ) -> list[RunRecord]:
+        predicates = []
+        parameters: list[object] = []
+        if ticker is not None:
+            predicates.append("ticker = ?")
+            parameters.append(ticker)
+        if status is not None:
+            predicates.append("status = ?")
+            parameters.append(status)
+        if before is not None:
+            predicates.append("(created_at < ? OR (created_at = ? AND run_id < ?))")
+            parameters.extend((before[0], before[0], before[1]))
+        where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM runs{where} ORDER BY created_at DESC, run_id DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+        return [_run_record(row) for row in rows]
 
     def find_evidence(
         self, run_id: str, stage_id: str, tool_name: str, argument_hash: str
@@ -295,14 +484,14 @@ class PluginStore:
                     expected_stage,
                     tool_name,
                     argument_hash,
-                    _json(arguments),
+                    canonical_json(arguments),
                     status,
                     fetched_at,
-                    _json(requested_window),
+                    canonical_json(requested_window),
                     content,
                     content_format,
-                    _json(source),
-                    _json(warnings),
+                    canonical_json(source),
+                    canonical_json(warnings),
                 ),
             ).rowcount
             row = connection.execute(
