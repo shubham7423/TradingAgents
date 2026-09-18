@@ -86,6 +86,12 @@ def test_sentiment_uses_recorded_blocks(monkeypatch):
     assert "SHOP.TO" in prompt and "French" in prompt
 
 
+def test_sentiment_window_start_is_shared_calendar_arithmetic():
+    from tradingagents.agents.analysts.sentiment_analyst import sentiment_window_start
+
+    assert sentiment_window_start("2026-03-01") == "2026-02-22"
+
+
 def test_sentiment_factory_uses_recorded_blocks_for_fallback(monkeypatch):
     from tradingagents.agents.analysts import sentiment_analyst as module
 
