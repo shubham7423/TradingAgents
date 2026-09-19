@@ -1,15 +1,37 @@
 import pytest
 
+from tradingagents.agents.analysts.fundamentals_analyst import build_fundamentals_prompt
+from tradingagents.agents.analysts.market_analyst import build_market_prompt
+from tradingagents.agents.analysts.news_analyst import build_news_prompt
+from tradingagents.agents.managers.portfolio_manager import build_portfolio_manager_prompt
+from tradingagents.agents.schemas import (
+    PortfolioDecision,
+    ResearchPlan,
+    SentimentReport,
+    TraderProposal,
+)
+from tradingagents.agents.trader.trader import build_trader_messages
 from tradingagents.plugin.store import (
     AnalysisSnapshot,
+    EvidenceRecord,
+    EvidenceRequirement,
     IncompatibleState,
     RunRecord,
     StageOutputRecord,
+    digest_json,
 )
-from tradingagents.plugin.workflow import initial_role_state, next_stage, rebuild_role_state
+from tradingagents.plugin.workflow import (
+    StageValidationError,
+    describe_stage,
+    initial_role_state,
+    next_stage,
+    prepare_output,
+    rebuild_role_state,
+    requirements_for,
+)
 
 
-def run_record(*, state_schema=1, prompt_schema=1, **overrides):
+def run_record(*, state_schema=1, prompt_schema=1, stage=None, status="active", **overrides):
     normalized_inputs = {
         "ticker": "AAPL",
         "asset_type": "stock",
@@ -26,9 +48,9 @@ def run_record(*, state_schema=1, prompt_schema=1, **overrides):
         request_hash="hash-1",
         normalized_inputs=normalized_inputs,
         ticker="AAPL",
-        status="active",
+        status=status,
         revision=1,
-        current_stage=f"analyst/{normalized_inputs['analysts'][0]}",
+        current_stage=stage or f"analyst/{normalized_inputs['analysts'][0]}",
         frozen_config={"output_language": normalized_inputs["output_language"]},
         instrument={
             "canonical_symbol": "AAPL",
@@ -39,6 +61,24 @@ def run_record(*, state_schema=1, prompt_schema=1, **overrides):
         prompt_schema=prompt_schema,
         created_at="2026-09-15T12:00:00+00:00",
         updated_at="2026-09-15T12:00:00+00:00",
+    )
+
+
+def evidence_record(stage_id, tool_name, arguments, content):
+    return EvidenceRecord(
+        evidence_id=f"evidence-{tool_name}",
+        run_id="run-1",
+        stage_id=stage_id,
+        tool_name=tool_name,
+        argument_hash="argument-hash",
+        arguments=arguments,
+        status="success",
+        fetched_at="2026-09-17T12:00:00+00:00",
+        requested_window={},
+        content=content,
+        content_format="text",
+        source={},
+        warnings=[],
     )
 
 
@@ -206,3 +246,227 @@ def test_rebuild_role_state_rejects_unsupported_run_schema(schema_overrides, mes
 
     with pytest.raises(IncompatibleState, match=message):
         rebuild_role_state(snapshot)
+
+
+def test_prepare_output_preserves_text_and_normalizes_structured_payloads():
+    text = prepare_output("research/bull/1", "  bullish case  ")
+    plan = prepare_output("research/manager", {
+        "recommendation": "Hold",
+        "rationale": "Evidence is balanced.",
+        "strategic_actions": "Keep current exposure.",
+    })
+
+    assert text.output_kind == "text"
+    assert text.canonical_output == "  bullish case  "
+    assert text.rendered_output == "  bullish case  "
+    assert plan.output_kind == "structured"
+    assert plan.canonical_output["recommendation"] == "Hold"
+    assert plan.rendered_output.startswith("**Recommendation**: Hold")
+    assert plan.output_hash == digest_json(plan.canonical_output)
+
+
+def test_prepare_output_returns_field_errors_without_freetext_fallback():
+    with pytest.raises(StageValidationError) as error:
+        prepare_output("trader", {"action": "Maybe", "reasoning": "unclear"})
+
+    assert error.value.errors[0]["loc"] == ("action",)
+
+
+@pytest.mark.parametrize("output", ["", " \n\t "])
+def test_prepare_output_rejects_blank_narrative(output):
+    with pytest.raises(StageValidationError, match="VALIDATION_ERROR"):
+        prepare_output("research/bull/1", output)
+
+
+@pytest.mark.parametrize(
+    ("stage_id", "output"),
+    [
+        ("research/bull/1", {"argument": "bullish"}),
+        ("research/manager", "Hold because evidence is balanced."),
+    ],
+)
+def test_prepare_output_rejects_wrong_native_kind(stage_id, output):
+    with pytest.raises(StageValidationError, match="VALIDATION_ERROR"):
+        prepare_output(stage_id, output)
+
+
+@pytest.mark.parametrize(
+    ("stage_id", "payload", "schema"),
+    [
+        (
+            "analyst/social",
+            {
+                "overall_band": "Mixed",
+                "overall_score": 5.0,
+                "confidence": "medium",
+                "narrative": "Sources disagree.",
+            },
+            SentimentReport,
+        ),
+        (
+            "research/manager",
+            {
+                "recommendation": "Hold",
+                "rationale": "Balanced evidence.",
+                "strategic_actions": "Maintain exposure.",
+            },
+            ResearchPlan,
+        ),
+        (
+            "trader",
+            {"action": "Buy", "reasoning": "Evidence supports entry."},
+            TraderProposal,
+        ),
+        (
+            "portfolio",
+            {
+                "rating": "Overweight",
+                "executive_summary": "Add gradually.",
+                "investment_thesis": "Risk-adjusted upside is favorable.",
+            },
+            PortfolioDecision,
+        ),
+    ],
+)
+def test_prepare_output_uses_each_native_structured_schema(stage_id, payload, schema):
+    prepared = prepare_output(stage_id, payload)
+
+    assert prepared.output_kind == "structured"
+    assert schema.model_validate(prepared.canonical_output)
+    assert prepared.rendered_output
+
+
+def test_prepare_output_rejects_canonical_payload_over_32000_characters():
+    with pytest.raises(StageValidationError, match="32,000"):
+        prepare_output("research/bull/1", "x" * 32_001)
+
+
+def test_market_and_sentiment_require_exact_recorded_attempts():
+    market = requirements_for(
+        run_record(stage="analyst/market", analysis_date="2026-09-17"),
+        "analyst/market",
+    )
+    social = requirements_for(
+        run_record(stage="analyst/social", analysis_date="2026-09-17"),
+        "analyst/social",
+    )
+
+    assert market == (EvidenceRequirement(
+        "get_verified_market_snapshot",
+        {"symbol": "AAPL", "curr_date": "2026-09-17"},
+    ),)
+    assert [item.tool_name for item in social] == [
+        "get_news", "fetch_stocktwits_messages", "fetch_reddit_posts",
+    ]
+    assert all(item.arguments["start_date"] == "2026-09-10" for item in social)
+    assert all(item.arguments["end_date"] == "2026-09-17" for item in social)
+    assert requirements_for(run_record(), "analyst/news") == ()
+
+
+@pytest.mark.parametrize(
+    ("stage_id", "builder"),
+    [
+        ("analyst/market", build_market_prompt),
+        ("analyst/news", build_news_prompt),
+        ("analyst/fundamentals", build_fundamentals_prompt),
+    ],
+)
+def test_describe_stage_uses_shared_analyst_prompt_builders(stage_id, builder):
+    run = run_record(stage=stage_id, analysts=[stage_id.split("/")[1]])
+    snapshot = AnalysisSnapshot(run=run, outputs=[], evidence=[])
+
+    view = describe_stage(snapshot)
+
+    assert view.instructions == builder(initial_role_state(run), output_language="French")
+
+
+def test_describe_sentiment_uses_saved_evidence_and_marks_missing_sources():
+    run = run_record(
+        stage="analyst/social",
+        analysts=["social"],
+        analysis_date="2026-09-17",
+    )
+    evidence = [
+        evidence_record(
+            "analyst/social",
+            "get_news",
+            {
+                "ticker": "AAPL",
+                "start_date": "2026-09-10",
+                "end_date": "2026-09-17",
+                "limit": 10,
+            },
+            "SAVED NEWS",
+        ),
+        evidence_record(
+            "analyst/social",
+            "fetch_stocktwits_messages",
+            {
+                "ticker": "AAPL",
+                "start_date": "2026-09-10",
+                "end_date": "2026-09-17",
+                "limit": 30,
+            },
+            "SAVED STOCKTWITS",
+        ),
+        evidence_record(
+            "analyst/news",
+            "fetch_reddit_posts",
+            {
+                "ticker": "AAPL",
+                "start_date": "2026-09-10",
+                "end_date": "2026-09-17",
+            },
+            "WRONG-STAGE REDDIT",
+        ),
+    ]
+
+    view = describe_stage(AnalysisSnapshot(run=run, outputs=[], evidence=evidence))
+
+    assert "SAVED NEWS" in view.instructions
+    assert "SAVED STOCKTWITS" in view.instructions
+    assert "<required evidence not yet recorded>" in view.instructions
+    assert "WRONG-STAGE REDDIT" not in view.instructions
+    assert [check.satisfied for check in view.required_evidence] == [True, True, False]
+    assert view.output_schema == SentimentReport.model_json_schema()
+
+
+def test_describe_stage_uses_rebuilt_state_and_frozen_role_contracts():
+    opening_run = run_record(stage="research/bull/1")
+    opening = describe_stage(AnalysisSnapshot(run=opening_run, outputs=[], evidence=[]))
+    assert "bear analyst has not spoken yet" in opening.instructions
+
+    trader_snapshot = snapshot_with_outputs()
+    trader_snapshot = AnalysisSnapshot(
+        run=run_record(stage="trader"),
+        outputs=trader_snapshot.outputs[:4],
+        evidence=[],
+    )
+    trader = describe_stage(trader_snapshot)
+    trader_state = rebuild_role_state(trader_snapshot)
+    assert trader.instructions == build_trader_messages(trader_state, output_language="French")
+    assert trader.output_schema == TraderProposal.model_json_schema()
+
+    portfolio_snapshot = snapshot_with_outputs()
+    portfolio_snapshot = AnalysisSnapshot(
+        run=run_record(stage="portfolio"),
+        outputs=portfolio_snapshot.outputs,
+        evidence=[],
+    )
+    portfolio = describe_stage(portfolio_snapshot)
+    portfolio_state = rebuild_role_state(portfolio_snapshot)
+    assert portfolio.instructions == build_portfolio_manager_prompt(
+        portfolio_state, output_language="French"
+    )
+    assert "PAST LESSONS" in portfolio.instructions
+    assert portfolio.output_schema == PortfolioDecision.model_json_schema()
+
+
+@pytest.mark.parametrize("status", ["ready_to_finalize", "cancelled", "completed"])
+def test_describe_stage_hides_inactive_runs(status):
+    view = describe_stage(AnalysisSnapshot(run=run_record(status=status), outputs=[], evidence=[]))
+
+    assert view.active_role is None
+    assert view.instructions is None
+    assert view.required_evidence == []
+    assert view.output_schema is None

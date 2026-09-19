@@ -1,21 +1,95 @@
 from collections.abc import Callable, Mapping
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
-from tradingagents.agents.managers.portfolio_manager import apply_portfolio_manager_output
-from tradingagents.agents.managers.research_manager import apply_research_manager_output
-from tradingagents.agents.researchers.bear_researcher import apply_bear_output
-from tradingagents.agents.researchers.bull_researcher import apply_bull_output
-from tradingagents.agents.risk_mgmt.aggressive_debator import apply_aggressive_output
-from tradingagents.agents.risk_mgmt.conservative_debator import apply_conservative_output
-from tradingagents.agents.risk_mgmt.neutral_debator import apply_neutral_output
-from tradingagents.agents.trader.trader import apply_trader_output
+from pydantic import ValidationError
+
+from tradingagents.agents.analysts.fundamentals_analyst import build_fundamentals_prompt
+from tradingagents.agents.analysts.market_analyst import build_market_prompt
+from tradingagents.agents.analysts.news_analyst import build_news_prompt
+from tradingagents.agents.analysts.sentiment_analyst import (
+    build_sentiment_prompt,
+    sentiment_window_start,
+)
+from tradingagents.agents.managers.portfolio_manager import (
+    apply_portfolio_manager_output,
+    build_portfolio_manager_prompt,
+)
+from tradingagents.agents.managers.research_manager import (
+    apply_research_manager_output,
+    build_research_manager_prompt,
+)
+from tradingagents.agents.researchers.bear_researcher import apply_bear_output, build_bear_prompt
+from tradingagents.agents.researchers.bull_researcher import apply_bull_output, build_bull_prompt
+from tradingagents.agents.risk_mgmt.aggressive_debator import (
+    apply_aggressive_output,
+    build_aggressive_prompt,
+)
+from tradingagents.agents.risk_mgmt.conservative_debator import (
+    apply_conservative_output,
+    build_conservative_prompt,
+)
+from tradingagents.agents.risk_mgmt.neutral_debator import (
+    apply_neutral_output,
+    build_neutral_prompt,
+)
+from tradingagents.agents.schemas import (
+    PortfolioDecision,
+    ResearchPlan,
+    SentimentReport,
+    TraderProposal,
+    render_pm_decision,
+    render_research_plan,
+    render_sentiment_report,
+    render_trader_proposal,
+)
+from tradingagents.agents.trader.trader import apply_trader_output, build_trader_messages
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
-from tradingagents.plugin.store import AnalysisSnapshot, IncompatibleState, RunRecord
+from tradingagents.plugin.store import (
+    AnalysisSnapshot,
+    EvidenceRequirement,
+    IncompatibleState,
+    RunRecord,
+    canonical_json,
+    digest_json,
+)
 
 ACTIVE = "active"
 READY_TO_FINALIZE = "ready_to_finalize"
 SUPPORTED_STATE_SCHEMA = 1
 SUPPORTED_PROMPT_SCHEMA = 1
+MAX_SUBMISSION_SIZE = 32_000
+MISSING_EVIDENCE = "<required evidence not yet recorded>"
+
+
+@dataclass(frozen=True)
+class PreparedOutput:
+    role_key: str
+    output_kind: Literal["text", "structured"]
+    canonical_output: object
+    rendered_output: str
+    output_hash: str
+
+
+@dataclass(frozen=True)
+class EvidenceCheck:
+    tool_name: str
+    arguments: dict[str, object]
+    satisfied: bool
+
+
+@dataclass(frozen=True)
+class StageView:
+    active_role: str | None
+    instructions: str | list[dict[str, str]] | None
+    required_evidence: list[EvidenceCheck]
+    output_schema: dict | None
+
+
+class StageValidationError(ValueError):
+    def __init__(self, message: str, errors: list[dict] | None = None):
+        super().__init__(f"VALIDATION_ERROR: {message}")
+        self.errors = [] if errors is None else errors
 
 
 def _require_compatible_run(run: RunRecord) -> None:
@@ -50,6 +124,90 @@ def role_key(stage_id: str) -> str:
     ):
         return parts[1]
     raise IncompatibleState(f"INCOMPATIBLE_STATE: unknown stage {stage_id}")
+
+
+_STRUCTURED_OUTPUTS = {
+    "social": (SentimentReport, render_sentiment_report),
+    "research_manager": (ResearchPlan, render_research_plan),
+    "trader": (TraderProposal, render_trader_proposal),
+    "portfolio_manager": (PortfolioDecision, render_pm_decision),
+}
+
+PROMPT_BUILDERS = {
+    "market": build_market_prompt,
+    "news": build_news_prompt,
+    "fundamentals": build_fundamentals_prompt,
+    "bull": build_bull_prompt,
+    "bear": build_bear_prompt,
+    "research_manager": build_research_manager_prompt,
+    "trader": build_trader_messages,
+    "aggressive": build_aggressive_prompt,
+    "conservative": build_conservative_prompt,
+    "neutral": build_neutral_prompt,
+    "portfolio_manager": build_portfolio_manager_prompt,
+}
+
+
+def prepare_output(stage_id: str, output: object) -> PreparedOutput:
+    key = role_key(stage_id)
+    structured = _STRUCTURED_OUTPUTS.get(key)
+    if structured is None:
+        if not isinstance(output, str):
+            raise StageValidationError("narrative output must be a string")
+        if not output.strip():
+            raise StageValidationError("narrative output must not be blank")
+        canonical_output = output
+        rendered_output = output
+        output_kind = "text"
+    else:
+        if not isinstance(output, dict):
+            raise StageValidationError("structured output must be an object")
+        schema, renderer = structured
+        try:
+            validated = schema.model_validate(output)
+        except ValidationError as exc:
+            raise StageValidationError(
+                "structured output is invalid",
+                exc.errors(include_url=False),
+            ) from exc
+        canonical_output = validated.model_dump(mode="json")
+        rendered_output = renderer(validated)
+        output_kind = "structured"
+
+    if len(canonical_json(canonical_output)) > MAX_SUBMISSION_SIZE:
+        raise StageValidationError("canonical output exceeds 32,000 characters")
+    return PreparedOutput(
+        role_key=key,
+        output_kind=output_kind,
+        canonical_output=canonical_output,
+        rendered_output=rendered_output,
+        output_hash=digest_json(canonical_output),
+    )
+
+
+def requirements_for(run: RunRecord, stage_id: str) -> tuple[EvidenceRequirement, ...]:
+    symbol = run.instrument["canonical_symbol"]
+    end_date = run.normalized_inputs["analysis_date"]
+    if stage_id == "analyst/market":
+        return (EvidenceRequirement(
+            "get_verified_market_snapshot",
+            {"symbol": symbol, "curr_date": end_date},
+        ),)
+    if stage_id == "analyst/social":
+        window = {
+            "ticker": symbol,
+            "start_date": sentiment_window_start(end_date),
+            "end_date": end_date,
+        }
+        return tuple(
+            EvidenceRequirement(tool_name, dict(window))
+            for tool_name in (
+                "get_news",
+                "fetch_stocktwits_messages",
+                "fetch_reddit_posts",
+            )
+        )
+    return ()
 
 
 def _round_number(stage_id: str, maximum: object) -> int:
@@ -181,3 +339,52 @@ def rebuild_role_state(snapshot: AnalysisSnapshot) -> dict[str, object]:
         expected_stage, _ = next_stage(snapshot.run, output.stage_id)
 
     return state
+
+
+def _matching_evidence(snapshot: AnalysisSnapshot, requirement: EvidenceRequirement):
+    for record in snapshot.evidence:
+        if record.stage_id != snapshot.run.current_stage or record.tool_name != requirement.tool_name:
+            continue
+        if all(
+            name in record.arguments
+            and canonical_json(record.arguments[name]) == canonical_json(value)
+            for name, value in requirement.arguments.items()
+        ):
+            return record
+    return None
+
+
+def describe_stage(snapshot: AnalysisSnapshot) -> StageView:
+    run = snapshot.run
+    _require_compatible_run(run)
+    if run.status != ACTIVE:
+        return StageView(None, None, [], None)
+
+    stage_id = run.current_stage
+    key = role_key(stage_id)
+    requirements = requirements_for(run, stage_id)
+    matches = [_matching_evidence(snapshot, requirement) for requirement in requirements]
+    checks = [
+        EvidenceCheck(requirement.tool_name, requirement.arguments, record is not None)
+        for requirement, record in zip(requirements, matches, strict=True)
+    ]
+    state = rebuild_role_state(snapshot)
+    language = run.normalized_inputs["output_language"]
+    if key == "social":
+        blocks = [MISSING_EVIDENCE if record is None else record.content for record in matches]
+        instructions = build_sentiment_prompt(
+            state,
+            output_language=language,
+            news_block=blocks[0],
+            stocktwits_block=blocks[1],
+            reddit_block=blocks[2],
+        )
+    else:
+        instructions = PROMPT_BUILDERS[key](state, output_language=language)
+    structured = _STRUCTURED_OUTPUTS.get(key)
+    return StageView(
+        active_role=key,
+        instructions=instructions,
+        required_evidence=checks,
+        output_schema=None if structured is None else structured[0].model_json_schema(),
+    )
