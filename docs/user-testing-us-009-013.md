@@ -39,7 +39,8 @@ reports or write decision memory; those capabilities begin in US-014.
 
   Command: `../../.venv/bin/python -m pytest -q`
 
-  Observed output: `936 passed, 2 skipped, 19 warnings, 73 subtests passed in 3.74s`.
+  Observed output after the final review fix: `944 passed, 2 skipped, 19 warnings, 73 subtests
+  passed in 3.81s`.
 
 - [x] Ruff
 
@@ -52,8 +53,8 @@ reports or write decision memory; those capabilities begin in US-014.
   Command: `../../.venv/bin/python -m pip wheel . --no-deps -w /tmp/tradingagents-dist`
 
   Observed output: `Successfully built tradingagents`. Created
-  `tradingagents-0.4.0-py3-none-any.whl` (203113 bytes), SHA-256
-  `281b157a9f7e09ba0dd20849a89f7b41632b3b25c6731e06d3f96f380cd03ddb`.
+  `tradingagents-0.4.0-py3-none-any.whl` (203190 bytes), SHA-256
+  `88434cd8d0d26fcb73245c23641d221c5c6cc5df419eca5c3f812ab0b5b0de32`.
 
 ## Local stdio discovery and call
 
