@@ -9,6 +9,7 @@ from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.interface import VendorRouteResult
 from tradingagents.plugin import data
 from tradingagents.plugin.store import (
+    IncompatibleState,
     PluginStore,
     RequestIdConflict,
     RunNotFound,
@@ -121,6 +122,60 @@ def test_get_analysis_default_section_and_evidence_modes(tools, store):
     assert evidence.evidence_page.run_id == run.run_id
     assert evidence.evidence_page.reused is True
     assert evidence.instructions is None
+
+
+@pytest.mark.parametrize("field", ["state_schema", "prompt_schema"])
+@pytest.mark.parametrize("mode", ["default", "section", "evidence"])
+def test_get_analysis_rejects_incompatible_run_in_every_mode(tools, store, field, mode):
+    run = _create_completed_market_stage(store)
+    tools.submit_stage(run.run_id, "analyst/market", 1, "Market report")
+    evidence_id = store.list_evidence(run.run_id)[0].evidence_id
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(f"UPDATE runs SET {field} = 2 WHERE run_id = ?", (run.run_id,))
+    kwargs = {
+        "default": {},
+        "section": {"section": "analyst/market"},
+        "evidence": {"evidence_id": evidence_id},
+    }[mode]
+
+    with pytest.raises(IncompatibleState, match="^INCOMPATIBLE_STATE:"):
+        tools.get_analysis(run.run_id, **kwargs)
+
+
+def test_get_analysis_section_uses_only_the_loaded_snapshot(tools, store, monkeypatch):
+    run = _create_completed_market_stage(store)
+    submitted = tools.submit_stage(run.run_id, "analyst/market", 1, "Market report")
+    snapshot = store.get_snapshot(run.run_id)
+    monkeypatch.setattr(store, "get_snapshot", lambda run_id: snapshot)
+    monkeypatch.setattr(
+        store,
+        "get_stage_output",
+        lambda *args: pytest.fail("section read escaped the loaded snapshot"),
+    )
+
+    result = tools.get_analysis(run.run_id, section="analyst/market")
+
+    assert result.revision == snapshot.run.revision
+    assert result.selected_section == result.sections[0]
+    assert result.selected_section.receipt_id == submitted.receipt.receipt_id
+
+
+def test_get_analysis_evidence_uses_only_the_loaded_snapshot(tools, store, monkeypatch):
+    run = _create_completed_market_stage(store)
+    snapshot = store.get_snapshot(run.run_id)
+    evidence = snapshot.evidence[0]
+    monkeypatch.setattr(store, "get_snapshot", lambda run_id: snapshot)
+    monkeypatch.setattr(
+        store,
+        "get_evidence",
+        lambda *args: pytest.fail("evidence read escaped the loaded snapshot"),
+    )
+
+    result = tools.get_analysis(run.run_id, evidence_id=evidence.evidence_id)
+
+    assert result.revision == snapshot.run.revision
+    assert result.evidence_page.evidence_id == result.evidence[0].evidence_id
+    assert result.evidence_page.content == evidence.content
 
 
 def test_get_analysis_rejects_invalid_read_mode_combinations(tools, store):

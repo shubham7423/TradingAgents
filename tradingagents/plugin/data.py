@@ -43,7 +43,7 @@ from tradingagents.plugin.store import (
     canonical_json,
     digest_json,
 )
-from tradingagents.plugin.workflow import WorkflowService, describe_stage
+from tradingagents.plugin.workflow import WorkflowService, _require_compatible_run, describe_stage
 
 AnalystKey = Literal["market", "social", "news", "fundamentals"]
 AssetType = Literal["stock", "crypto"]
@@ -1199,13 +1199,21 @@ class PluginTools:
         if evidence_id is None and page_size is not None:
             raise ValueError("page_size requires evidence_id")
 
+        _require_compatible_run(snapshot.run)
+
         if section is not None:
-            selected = self._store.get_stage_output(run_id, section)
+            selected = next((item for item in snapshot.outputs if item.stage_id == section), None)
             if selected is None:
                 raise RunNotFound(f"RUN_NOT_FOUND: section {section} does not exist in {run_id}")
             return self._analysis_result(snapshot, selected_section=selected)
         if evidence_id is not None:
-            evidence = self._store.get_evidence(run_id, evidence_id)
+            evidence = next(
+                (item for item in snapshot.evidence if item.evidence_id == evidence_id), None
+            )
+            if evidence is None:
+                raise RunNotFound(
+                    f"RUN_NOT_FOUND: evidence {evidence_id} does not exist in {run_id}"
+                )
             return self._analysis_result(
                 snapshot,
                 evidence_page=_page_record(
