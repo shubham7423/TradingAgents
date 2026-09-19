@@ -27,6 +27,30 @@ class IncompatibleState(RuntimeError):
     pass
 
 
+class MissingEvidence(RuntimeError):
+    pass
+
+
+class StaleRevision(RuntimeError):
+    pass
+
+
+class WrongStage(RuntimeError):
+    pass
+
+
+class StageAlreadyAccepted(RuntimeError):
+    pass
+
+
+class RunCancelled(RuntimeError):
+    pass
+
+
+class RunNotActive(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class RunRecord:
     run_id: str
@@ -503,6 +527,154 @@ class PluginStore:
                 (run_id, expected_stage, tool_name, argument_hash),
             ).fetchone()
             return _evidence_record(row), bool(inserted)
+
+    def accept_stage(
+        self,
+        *,
+        run_id: str,
+        stage_id: str,
+        expected_revision: int,
+        role_key: str,
+        output_kind: Literal["text", "structured"],
+        canonical_output: object,
+        rendered_output: str,
+        output_hash: str,
+        required_evidence: tuple[EvidenceRequirement, ...],
+        next_stage: str,
+        next_status: str,
+        now: str,
+    ) -> tuple[RunRecord, StageOutputRecord, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise RunNotFound(f"RUN_NOT_FOUND: analysis {run_id} does not exist")
+            if run["state_schema"] != 1:
+                raise IncompatibleState(
+                    "INCOMPATIBLE_STATE: state schema "
+                    f"{run['state_schema']} is not supported; expected 1"
+                )
+            if run["prompt_schema"] != 1:
+                raise IncompatibleState(
+                    "INCOMPATIBLE_STATE: prompt schema "
+                    f"{run['prompt_schema']} is not supported; expected 1"
+                )
+
+            existing = connection.execute(
+                "SELECT * FROM stage_outputs WHERE run_id = ? AND stage_id = ?",
+                (run_id, stage_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["output_hash"] != output_hash:
+                    raise StageAlreadyAccepted(
+                        f"STAGE_ALREADY_ACCEPTED: stage {stage_id} has a different accepted payload"
+                    )
+                return _run_record(run), _stage_output_record(existing), False
+
+            if run["status"] == "cancelled":
+                raise RunCancelled(f"RUN_CANCELLED: analysis {run_id} is cancelled")
+            if run["status"] != "active":
+                raise RunNotActive(
+                    f"RUN_NOT_ACTIVE: analysis {run_id} has status {run['status']}"
+                )
+            if run["current_stage"] != stage_id:
+                raise WrongStage(
+                    f"WRONG_STAGE: expected {run['current_stage']}, got {stage_id}"
+                )
+            if run["revision"] != expected_revision:
+                raise StaleRevision(
+                    f"STALE_REVISION: expected {expected_revision}, current {run['revision']}"
+                )
+
+            evidence = connection.execute(
+                "SELECT tool_name, arguments_json FROM evidence "
+                "WHERE run_id = ? AND stage_id = ?",
+                (run_id, run["current_stage"]),
+            ).fetchall()
+            for requirement in required_evidence:
+                if not any(
+                    row["tool_name"] == requirement.tool_name
+                    and all(
+                        name in arguments
+                        and canonical_json(arguments[name]) == canonical_json(value)
+                        for name, value in requirement.arguments.items()
+                    )
+                    for row in evidence
+                    for arguments in (json.loads(row["arguments_json"]),)
+                ):
+                    raise MissingEvidence(
+                        f"MISSING_EVIDENCE: {requirement.tool_name} "
+                        f"{canonical_json(requirement.arguments)}"
+                    )
+
+            receipt_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO stage_outputs (
+                    receipt_id, run_id, stage_id, role_key, output_kind,
+                    canonical_output_json, rendered_output, output_hash,
+                    accepted_revision, accepted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt_id,
+                    run_id,
+                    stage_id,
+                    role_key,
+                    output_kind,
+                    canonical_json(canonical_output),
+                    rendered_output,
+                    output_hash,
+                    expected_revision,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?, revision = revision + 1, current_stage = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (next_status, next_stage, now, run_id),
+            )
+            advanced = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            receipt = connection.execute(
+                "SELECT * FROM stage_outputs WHERE receipt_id = ?", (receipt_id,)
+            ).fetchone()
+            return _run_record(advanced), _stage_output_record(receipt), True
+
+    def cancel_run(
+        self, run_id: str, expected_revision: int, now: str
+    ) -> tuple[RunRecord, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFound(f"RUN_NOT_FOUND: analysis {run_id} does not exist")
+            if row["status"] == "cancelled":
+                return _run_record(row), False
+            if row["status"] not in {"active", "ready_to_finalize"}:
+                raise RunNotActive(
+                    f"RUN_NOT_ACTIVE: analysis {run_id} has status {row['status']}"
+                )
+            if row["revision"] != expected_revision:
+                raise StaleRevision(
+                    f"STALE_REVISION: expected {expected_revision}, current {row['revision']}"
+                )
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'cancelled', revision = revision + 1, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (now, run_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return _run_record(updated), True
 
     def list_evidence(self, run_id: str) -> list[EvidenceRecord]:
         with self._connect() as connection:

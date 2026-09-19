@@ -1,13 +1,21 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from tradingagents.plugin.store import (
+    EvidenceRequirement,
     IncompatibleState,
+    MissingEvidence,
     PluginStore,
     RequestIdConflict,
+    RunCancelled,
+    RunNotActive,
     RunNotFound,
+    StageAlreadyAccepted,
+    StaleRevision,
     StaleRun,
+    WrongStage,
 )
 
 
@@ -22,6 +30,51 @@ def run_values(request_hash="hash-one", now="2026-09-15T12:00:00+00:00"):
         "lessons": "past lesson",
         "now": now,
     }
+
+
+def prepared_stage_values(run, **overrides):
+    values = {
+        "run_id": run.run_id,
+        "stage_id": "analyst/market",
+        "expected_revision": 1,
+        "role_key": "market",
+        "output_kind": "text",
+        "canonical_output": "Market report",
+        "rendered_output": "Market report",
+        "output_hash": "output-hash",
+        "required_evidence": (),
+        "next_stage": "research/bull/1",
+        "next_status": "active",
+        "now": "2026-09-15T12:02:00+00:00",
+    }
+    values.update(overrides)
+    return values
+
+
+def _set_run_fields(store, run_id, **fields):
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            f"UPDATE runs SET {assignments} WHERE run_id = ?",
+            (*fields.values(), run_id),
+        )
+
+
+def _save_market_evidence(store, run, status="success", arguments=None):
+    return store.save_evidence(
+        run_id=run.run_id,
+        expected_stage="analyst/market",
+        tool_name="get_verified_market_snapshot",
+        argument_hash="market-args",
+        arguments=arguments or {"symbol": "AAPL", "curr_date": "2026-09-15"},
+        status=status,
+        fetched_at="2026-09-15T12:01:00+00:00",
+        requested_window={},
+        content="market snapshot",
+        content_format="text",
+        source={"vendor": "yfinance"},
+        warnings=[],
+    )
 
 
 def _create_v1_database(path):
@@ -231,3 +284,201 @@ def test_unknown_run_is_rejected(tmp_path):
 
     assert str(get_error.value) == message
     assert str(list_error.value) == message
+
+
+def test_accept_stage_is_atomic_and_identical_retry_returns_receipt(tmp_path):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+    values = prepared_stage_values(run)
+
+    advanced, receipt, created = store.accept_stage(**values)
+    retried, repeated, repeated_created = store.accept_stage(**values)
+
+    assert created is True and repeated_created is False
+    assert repeated == receipt
+    assert retried == advanced
+    assert receipt.accepted_revision == 1
+    assert advanced.current_stage == "research/bull/1"
+    assert advanced.revision == 2
+
+
+def test_accept_stage_rejects_conflicting_retry_without_mutation(tmp_path):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+    advanced, receipt, _ = store.accept_stage(**prepared_stage_values(run))
+
+    with pytest.raises(StageAlreadyAccepted, match="^STAGE_ALREADY_ACCEPTED:"):
+        store.accept_stage(**prepared_stage_values(run, output_hash="different-hash"))
+
+    assert store.get_run(run.run_id) == advanced
+    assert store.get_stage_output(run.run_id, "analyst/market") == receipt
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error", "code"),
+    [
+        ({"expected_revision": 2}, StaleRevision, "STALE_REVISION"),
+        ({"stage_id": "analyst/news"}, WrongStage, "WRONG_STAGE"),
+    ],
+)
+def test_accept_stage_rejects_stale_revision_and_wrong_stage(tmp_path, overrides, error, code):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+
+    with pytest.raises(error, match=f"^{code}:"):
+        store.accept_stage(**prepared_stage_values(run, **overrides))
+
+    assert store.get_run(run.run_id) == run
+    assert store.get_stage_output(run.run_id, overrides.get("stage_id", "analyst/market")) is None
+
+
+def test_accept_stage_rejects_cancelled_run_before_stage_and_revision_checks(tmp_path):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+    cancelled, _ = store.cancel_run(run.run_id, 1, "2026-09-15T12:01:00+00:00")
+
+    with pytest.raises(RunCancelled, match="^RUN_CANCELLED:"):
+        store.accept_stage(
+            **prepared_stage_values(run, stage_id="analyst/news", expected_revision=999)
+        )
+
+    assert store.get_run(run.run_id) == cancelled
+
+
+def test_accept_stage_rejects_missing_or_mismatched_evidence_without_mutation(tmp_path):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+    requirement = EvidenceRequirement(
+        "get_verified_market_snapshot",
+        {"symbol": "AAPL", "curr_date": "2026-09-15"},
+    )
+    _save_market_evidence(
+        store,
+        run,
+        arguments={"symbol": "AAPL", "curr_date": "2026-09-14", "extra": True},
+    )
+
+    with pytest.raises(MissingEvidence, match="^MISSING_EVIDENCE:.*get_verified_market_snapshot"):
+        store.accept_stage(**prepared_stage_values(run, required_evidence=(requirement,)))
+
+    assert store.get_run(run.run_id) == run
+    assert store.get_stage_output(run.run_id, "analyst/market") is None
+
+
+@pytest.mark.parametrize("status", ["success", "no_data", "unavailable"])
+def test_accept_stage_accepts_each_persisted_terminal_evidence_status(tmp_path, status):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+    _save_market_evidence(store, run, status=status)
+    requirement = EvidenceRequirement(
+        "get_verified_market_snapshot",
+        {"symbol": "AAPL", "curr_date": "2026-09-15"},
+    )
+
+    advanced, _, created = store.accept_stage(
+        **prepared_stage_values(run, required_evidence=(requirement,))
+    )
+
+    assert created is True
+    assert advanced.revision == 2
+
+
+@pytest.mark.parametrize(("field", "value"), [("state_schema", 2), ("prompt_schema", 2)])
+def test_accept_stage_rejects_unknown_per_run_schema_without_mutation(tmp_path, field, value):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+    _set_run_fields(store, run.run_id, **{field: value})
+
+    with pytest.raises(IncompatibleState, match="^INCOMPATIBLE_STATE:"):
+        store.accept_stage(**prepared_stage_values(run))
+
+    assert store.get_run(run.run_id).revision == 1
+    assert store.get_stage_output(run.run_id, "analyst/market") is None
+
+
+@pytest.mark.parametrize("same_payload", [True, False])
+def test_two_writer_accept_stage_advances_once(tmp_path, same_payload):
+    first_store = PluginStore(tmp_path)
+    second_store = PluginStore(tmp_path)
+    run, _ = first_store.create_run(**run_values())
+    first_values = prepared_stage_values(run)
+    second_values = prepared_stage_values(
+        run,
+        output_hash="output-hash" if same_payload else "different-hash",
+    )
+
+    def accept(store, values):
+        try:
+            return store.accept_stage(**values)
+        except (StageAlreadyAccepted, StaleRevision) as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda item: accept(*item),
+                [(first_store, first_values), (second_store, second_values)],
+            )
+        )
+
+    successes = [result for result in results if isinstance(result, tuple)]
+    failures = [result for result in results if isinstance(result, Exception)]
+    assert first_store.get_run(run.run_id).revision == 2
+    assert len(first_store.get_snapshot(run.run_id).outputs) == 1
+    if same_payload:
+        assert len(successes) == 2
+        assert sorted(result[2] for result in successes) == [False, True]
+        assert successes[0][1] == successes[1][1]
+    else:
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], StageAlreadyAccepted)
+
+
+@pytest.mark.parametrize("initial_status", ["active", "ready_to_finalize"])
+def test_cancel_run_is_atomic_idempotent_and_preserves_stage(tmp_path, initial_status):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+    _set_run_fields(store, run.run_id, status=initial_status, current_stage="portfolio")
+
+    cancelled, changed = store.cancel_run(
+        run.run_id, 1, "2026-09-15T12:01:00+00:00"
+    )
+    repeated, repeated_changed = store.cancel_run(
+        run.run_id, 999, "2026-09-15T12:02:00+00:00"
+    )
+
+    assert changed is True and repeated_changed is False
+    assert repeated == cancelled
+    assert cancelled.status == "cancelled"
+    assert cancelled.revision == 2
+    assert cancelled.current_stage == "portfolio"
+
+
+def test_cancel_run_rejects_stale_revision_and_completed_run(tmp_path):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+
+    with pytest.raises(StaleRevision, match="^STALE_REVISION:"):
+        store.cancel_run(run.run_id, 2, "2026-09-15T12:01:00+00:00")
+    _set_run_fields(store, run.run_id, status="completed")
+    with pytest.raises(RunNotActive, match="^RUN_NOT_ACTIVE:"):
+        store.cancel_run(run.run_id, 1, "2026-09-15T12:01:00+00:00")
+
+    assert store.get_run(run.run_id).revision == 1
+
+
+def test_cancel_run_preserves_evidence_and_outputs(tmp_path):
+    store = PluginStore(tmp_path)
+    run, _ = store.create_run(**run_values())
+    evidence, _ = _save_market_evidence(store, run)
+    advanced, receipt, _ = store.accept_stage(**prepared_stage_values(run))
+
+    cancelled, _ = store.cancel_run(
+        run.run_id, advanced.revision, "2026-09-15T12:03:00+00:00"
+    )
+    snapshot = store.get_snapshot(run.run_id)
+
+    assert snapshot.run == cancelled
+    assert snapshot.outputs == [receipt]
+    assert snapshot.evidence == [evidence]

@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from tradingagents.agents.analysts.fundamentals_analyst import build_fundamentals_prompt
@@ -16,12 +18,19 @@ from tradingagents.plugin.store import (
     EvidenceRecord,
     EvidenceRequirement,
     IncompatibleState,
+    MissingEvidence,
+    PluginStore,
     RunRecord,
+    StageAlreadyAccepted,
     StageOutputRecord,
+    StaleRevision,
+    WrongStage,
     digest_json,
 )
 from tradingagents.plugin.workflow import (
+    CancelledAnalysis,
     StageValidationError,
+    WorkflowService,
     describe_stage,
     initial_role_state,
     next_stage,
@@ -29,6 +38,85 @@ from tradingagents.plugin.workflow import (
     rebuild_role_state,
     requirements_for,
 )
+
+
+@pytest.fixture
+def store(tmp_path):
+    return PluginStore(tmp_path)
+
+
+def create_run(store, *, analysts=None, stage=None, status="active"):
+    analysts = analysts or ["market"]
+    normalized_inputs = {
+        "ticker": "AAPL",
+        "asset_type": "stock",
+        "analysis_date": "2026-09-15",
+        "analysts": analysts,
+        "research_rounds": 1,
+        "risk_rounds": 1,
+        "output_language": "English",
+    }
+    run, _ = store.create_run(
+        request_id=f"request-{stage or analysts[0]}",
+        request_hash="request-hash",
+        normalized_inputs=normalized_inputs,
+        current_stage=stage or f"analyst/{analysts[0]}",
+        frozen_config={"output_language": "English"},
+        instrument={
+            "requested_symbol": "AAPL",
+            "canonical_symbol": "AAPL",
+            "context": "Apple Inc. (AAPL, NASDAQ, USD)",
+        },
+        lessons="",
+        now="2026-09-15T12:00:00+00:00",
+    )
+    if status != "active":
+        with sqlite3.connect(store.database_path) as connection:
+            connection.execute(
+                "UPDATE runs SET status = ? WHERE run_id = ?", (status, run.run_id)
+            )
+        run = store.get_run(run.run_id)
+    return run
+
+
+def save_required_market_snapshot(store, run):
+    store.save_evidence(
+        run_id=run.run_id,
+        expected_stage="analyst/market",
+        tool_name="get_verified_market_snapshot",
+        argument_hash="market-snapshot",
+        arguments={"symbol": "AAPL", "curr_date": "2026-09-15"},
+        status="success",
+        fetched_at="2026-09-15T12:01:00+00:00",
+        requested_window={},
+        content="market snapshot",
+        content_format="text",
+        source={},
+        warnings=[],
+    )
+
+
+def save_required_social_evidence(store, run):
+    arguments = {
+        "ticker": "AAPL",
+        "start_date": "2026-09-08",
+        "end_date": "2026-09-15",
+    }
+    for tool_name in ("get_news", "fetch_stocktwits_messages", "fetch_reddit_posts"):
+        store.save_evidence(
+            run_id=run.run_id,
+            expected_stage="analyst/social",
+            tool_name=tool_name,
+            argument_hash=tool_name,
+            arguments=arguments,
+            status="success",
+            fetched_at="2026-09-15T12:01:00+00:00",
+            requested_window={},
+            content=tool_name,
+            content_format="text",
+            source={},
+            warnings=[],
+        )
 
 
 def run_record(*, state_schema=1, prompt_schema=1, stage=None, status="active", **overrides):
@@ -470,3 +558,127 @@ def test_describe_stage_hides_inactive_runs(status):
     assert view.instructions is None
     assert view.required_evidence == []
     assert view.output_schema is None
+
+
+def test_service_submits_selected_analyst_and_returns_next_stage(store):
+    run = create_run(store, analysts=["market"])
+    save_required_market_snapshot(store, run)
+    service = WorkflowService(store)
+
+    result = service.submit_stage(run.run_id, "analyst/market", 1, "Market report")
+
+    assert result.receipt.stage_id == "analyst/market"
+    assert result.revision == 2
+    assert result.current_stage == "research/bull/1"
+    assert result.status == "active"
+
+
+def test_service_structured_field_error_does_not_advance(store):
+    run = create_run(store, stage="trader")
+
+    with pytest.raises(StageValidationError) as error:
+        WorkflowService(store).submit_stage(
+            run.run_id,
+            "trader",
+            1,
+            {"action": "Maybe", "reasoning": "unclear"},
+        )
+
+    assert error.value.errors[0]["loc"] == ("action",)
+    assert store.get_run(run.run_id) == run
+    assert store.get_snapshot(run.run_id).outputs == []
+
+
+def test_service_missing_evidence_does_not_advance(store):
+    run = create_run(store, analysts=["market"])
+
+    with pytest.raises(MissingEvidence, match="^MISSING_EVIDENCE:"):
+        WorkflowService(store).submit_stage(
+            run.run_id, "analyst/market", 1, "Market report"
+        )
+
+    assert store.get_run(run.run_id) == run
+    assert store.get_snapshot(run.run_id).outputs == []
+
+
+def test_service_canonical_retry_returns_original_receipt(store):
+    run = create_run(store, analysts=["social"])
+    save_required_social_evidence(store, run)
+    service = WorkflowService(store)
+    first_payload = {
+        "overall_band": "Mixed",
+        "overall_score": 5.0,
+        "confidence": "medium",
+        "narrative": "Sources disagree.",
+    }
+
+    first = service.submit_stage(run.run_id, "analyst/social", 1, first_payload)
+    retried = service.submit_stage(
+        run.run_id,
+        "analyst/social",
+        1,
+        dict(reversed(list(first_payload.items()))),
+    )
+
+    assert retried == first
+
+
+def test_service_conflicting_retry_is_rejected(store):
+    run = create_run(store, analysts=["market"])
+    save_required_market_snapshot(store, run)
+    service = WorkflowService(store)
+    accepted = service.submit_stage(run.run_id, "analyst/market", 1, "Market report")
+
+    with pytest.raises(StageAlreadyAccepted, match="^STAGE_ALREADY_ACCEPTED:"):
+        service.submit_stage(run.run_id, "analyst/market", 1, "Different report")
+
+    assert store.get_run(run.run_id).revision == accepted.revision
+
+
+def test_service_rejects_stale_revision_and_out_of_order_stage(store):
+    run = create_run(store, analysts=["market"])
+    save_required_market_snapshot(store, run)
+    service = WorkflowService(store)
+
+    with pytest.raises(StaleRevision, match="^STALE_REVISION:"):
+        service.submit_stage(run.run_id, "analyst/market", 2, "Market report")
+    with pytest.raises(WrongStage, match="^WRONG_STAGE:"):
+        service.submit_stage(run.run_id, "risk/aggressive/1", 1, "Risk report")
+
+    assert store.get_run(run.run_id) == run
+
+
+def test_service_final_portfolio_submission_is_ready_to_finalize(store):
+    run = create_run(store, stage="portfolio")
+    payload = {
+        "rating": "Overweight",
+        "executive_summary": "Add gradually.",
+        "investment_thesis": "Risk-adjusted upside is favorable.",
+    }
+
+    result = WorkflowService(store).submit_stage(run.run_id, "portfolio", 1, payload)
+
+    assert result.status == "ready_to_finalize"
+    assert result.current_stage == "finalize"
+    assert result.revision == 2
+
+
+@pytest.mark.parametrize("status", ["active", "ready_to_finalize"])
+def test_service_cancellation_is_idempotent_and_reports_change(store, status):
+    run = create_run(store, stage="portfolio", status=status)
+    service = WorkflowService(store)
+
+    cancelled = service.cancel_analysis(run.run_id, 1)
+    repeated = service.cancel_analysis(run.run_id, 999)
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.revision == 2
+    assert cancelled.current_stage == "portfolio"
+    assert cancelled.changed is True
+    assert repeated == CancelledAnalysis(
+        run_id=run.run_id,
+        status="cancelled",
+        revision=2,
+        current_stage="portfolio",
+        changed=False,
+    )

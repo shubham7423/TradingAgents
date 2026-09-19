@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import ValidationError
@@ -49,7 +50,9 @@ from tradingagents.plugin.store import (
     AnalysisSnapshot,
     EvidenceRequirement,
     IncompatibleState,
+    PluginStore,
     RunRecord,
+    StageOutputRecord,
     canonical_json,
     digest_json,
 )
@@ -86,10 +89,81 @@ class StageView:
     output_schema: dict | None
 
 
+@dataclass(frozen=True)
+class AcceptedStage:
+    run_id: str
+    status: Literal["active", "ready_to_finalize"]
+    revision: int
+    current_stage: str
+    receipt: StageOutputRecord
+
+
+@dataclass(frozen=True)
+class CancelledAnalysis:
+    run_id: str
+    status: Literal["cancelled"]
+    revision: int
+    current_stage: str
+    changed: bool
+
+
 class StageValidationError(ValueError):
     def __init__(self, message: str, errors: list[dict] | None = None):
         super().__init__(f"VALIDATION_ERROR: {message}")
         self.errors = [] if errors is None else errors
+
+
+class WorkflowService:
+    def __init__(self, store: PluginStore):
+        self._store = store
+
+    def submit_stage(
+        self,
+        run_id: str,
+        stage_id: str,
+        expected_revision: int,
+        output: object,
+    ) -> AcceptedStage:
+        snapshot = self._store.get_snapshot(run_id)
+        _require_compatible_run(snapshot.run)
+        prepared = prepare_output(stage_id, output)
+        required_evidence = requirements_for(snapshot.run, stage_id)
+        following_stage, following_status = next_stage(snapshot.run, stage_id)
+        run, receipt, _ = self._store.accept_stage(
+            run_id=run_id,
+            stage_id=stage_id,
+            expected_revision=expected_revision,
+            role_key=prepared.role_key,
+            output_kind=prepared.output_kind,
+            canonical_output=prepared.canonical_output,
+            rendered_output=prepared.rendered_output,
+            output_hash=prepared.output_hash,
+            required_evidence=required_evidence,
+            next_stage=following_stage,
+            next_status=following_status,
+            now=datetime.now(timezone.utc).isoformat(),
+        )
+        return AcceptedStage(
+            run_id=run.run_id,
+            status=run.status,
+            revision=run.revision,
+            current_stage=run.current_stage,
+            receipt=receipt,
+        )
+
+    def cancel_analysis(self, run_id: str, expected_revision: int) -> CancelledAnalysis:
+        run, changed = self._store.cancel_run(
+            run_id,
+            expected_revision,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        return CancelledAnalysis(
+            run_id=run.run_id,
+            status="cancelled",
+            revision=run.revision,
+            current_stage=run.current_stage,
+            changed=changed,
+        )
 
 
 def _require_compatible_run(run: RunRecord) -> None:
