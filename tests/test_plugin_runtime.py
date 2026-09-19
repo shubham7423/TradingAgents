@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +16,9 @@ EXPECTED_TOOLS = {
     "get_capabilities",
     "start_analysis",
     "get_analysis",
+    "submit_stage",
+    "list_analyses",
+    "cancel_analysis",
     "get_stock_data",
     "get_indicators",
     "get_verified_market_snapshot",
@@ -147,6 +151,8 @@ def test_main_hints_install_when_mcp_is_missing(tmp_path, monkeypatch, capsys):
 
 def test_stdio_protocol_stdout_is_json_rpc(tmp_path):
     pytest.importorskip("mcp")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parents[1])
     process = subprocess.Popen(
         [
             sys.executable,
@@ -160,6 +166,7 @@ def test_stdio_protocol_stdout_is_json_rpc(tmp_path):
         stderr=subprocess.PIPE,
         text=True,
         cwd=tmp_path,
+        env=env,
     )
     deadline = time.monotonic() + 30
     stdout_lines = []

@@ -34,12 +34,16 @@ from tradingagents.dataflows.symbol_utils import NoMarketDataError, crypto_base,
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
 from tradingagents.plugin.store import (
+    AnalysisSnapshot,
     EvidenceRecord,
     PluginStore,
+    RunNotFound,
     RunRecord,
+    StageOutputRecord,
     canonical_json,
     digest_json,
 )
+from tradingagents.plugin.workflow import WorkflowService, describe_stage
 
 AnalystKey = Literal["market", "social", "news", "fundamentals"]
 AssetType = Literal["stock", "crypto"]
@@ -97,6 +101,28 @@ def _decode_cursor(cursor: str) -> tuple[str, int]:
     except (UnicodeEncodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid evidence cursor") from exc
     return evidence_id, offset
+
+
+def _encode_analysis_cursor(created_at: str, run_id: str) -> str:
+    payload = canonical_json({"created_at": created_at, "run_id": run_id}).encode()
+    return base64.urlsafe_b64encode(payload).decode()
+
+
+def _decode_analysis_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        raw = base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True)
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) != {"created_at", "run_id"}:
+            raise ValueError
+        created_at = payload["created_at"]
+        if not isinstance(created_at, str):
+            raise ValueError
+        run_id = str(UUID(payload["run_id"]))
+        if cursor != _encode_analysis_cursor(created_at, run_id):
+            raise ValueError
+    except (UnicodeEncodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid analysis cursor") from exc
+    return created_at, run_id
 
 
 def _page_size(value: int | None) -> int:
@@ -418,17 +444,89 @@ class AnalysisResult(BaseModel):
     instrument: dict
     lessons: str
     evidence: list[EvidenceMetadata] = Field(default_factory=list)
+    active_role: str | None = None
+    instructions: str | list[dict[str, str]] | None = None
+    required_evidence: list[EvidenceCheckResult] = Field(default_factory=list)
+    output_schema: dict | None = None
+    sections: list[StageOutputResult] = Field(default_factory=list)
+    selected_section: StageOutputResult | None = None
+    evidence_page: DataToolResult | None = None
+
+
+class EvidenceCheckResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str
+    arguments: dict[str, object]
+    satisfied: bool
+
+
+class StageOutputResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    receipt_id: str
+    stage_id: str
+    role_key: str
+    output_kind: Literal["text", "structured"]
+    canonical_output: object
+    rendered_output: str
+    accepted_revision: int
+    accepted_at: str
+
+
+class AnalysisSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    ticker: str
+    analysis_date: str
+    status: Literal["active", "ready_to_finalize", "completed", "cancelled"]
+    revision: int
+    current_stage: str
+    created_at: str
+    updated_at: str
+
+
+class AnalysisListResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    analyses: list[AnalysisSummary]
+    next_cursor: str | None = None
+
+
+class SubmissionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    status: Literal["active", "ready_to_finalize"]
+    revision: int
+    current_stage: str
+    receipt: StageOutputResult
+
+
+class CancellationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    status: Literal["cancelled"]
+    revision: int
+    current_stage: str
+    changed: bool
 
 
 class PluginTools:
     def __init__(self, store: PluginStore, server_config: dict | None = None):
         self._store = store
+        self._workflow = WorkflowService(store)
         self._server_config = deepcopy(server_config if server_config is not None else get_config())
 
     def public_operations(self) -> tuple[Callable[..., object], ...]:
         return (
             self.start_analysis,
             self.get_analysis,
+            self.submit_stage,
+            self.list_analyses,
+            self.cancel_analysis,
             self.get_stock_data,
             self.get_indicators,
             self.get_verified_market_snapshot,
@@ -1085,10 +1183,78 @@ class PluginTools:
         )
         return self._analysis_result(record)
 
-    def get_analysis(self, run_id: str) -> AnalysisResult:
-        return self._analysis_result(self._store.get_run(run_id))
+    def get_analysis(
+        self,
+        run_id: str,
+        section: str | None = None,
+        evidence_id: str | None = None,
+        cursor: str | None = None,
+        page_size: int | None = None,
+    ) -> AnalysisResult:
+        snapshot = self._store.get_snapshot(run_id)
+        if section is not None and evidence_id is not None:
+            raise ValueError("section and evidence_id are mutually exclusive")
+        if evidence_id is None and cursor is not None:
+            raise ValueError("cursor requires evidence_id")
+        if evidence_id is None and page_size is not None:
+            raise ValueError("page_size requires evidence_id")
 
-    def _analysis_result(self, record: RunRecord) -> AnalysisResult:
+        if section is not None:
+            selected = self._store.get_stage_output(run_id, section)
+            if selected is None:
+                raise RunNotFound(f"RUN_NOT_FOUND: section {section} does not exist in {run_id}")
+            return self._analysis_result(snapshot, selected_section=selected)
+        if evidence_id is not None:
+            evidence = self._store.get_evidence(run_id, evidence_id)
+            return self._analysis_result(
+                snapshot,
+                evidence_page=_page_record(
+                    evidence, cursor=cursor, page_size=page_size, reused=True
+                ),
+            )
+
+        return self._analysis_result(snapshot, stage_view=describe_stage(snapshot))
+
+    def submit_stage(
+        self,
+        run_id: str,
+        stage_id: str,
+        expected_revision: int,
+        output: str | dict,
+    ) -> SubmissionResult:
+        return self._submission_result(
+            self._workflow.submit_stage(run_id, stage_id, expected_revision, output)
+        )
+
+    def list_analyses(
+        self,
+        ticker: str | None = None,
+        status: Literal["active", "ready_to_finalize", "completed", "cancelled"] | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> AnalysisListResult:
+        return self._list_result(ticker, status, limit, cursor)
+
+    def cancel_analysis(
+        self,
+        run_id: str,
+        expected_revision: int,
+    ) -> CancellationResult:
+        return self._cancellation_result(
+            self._workflow.cancel_analysis(run_id, expected_revision)
+        )
+
+    def _analysis_result(
+        self,
+        snapshot: AnalysisSnapshot | RunRecord,
+        *,
+        stage_view=None,
+        selected_section: StageOutputRecord | None = None,
+        evidence_page: DataToolResult | None = None,
+    ) -> AnalysisResult:
+        if isinstance(snapshot, RunRecord):
+            snapshot = self._store.get_snapshot(snapshot.run_id)
+        record = snapshot.run
         inputs = record.normalized_inputs
         evidence = [
             EvidenceMetadata(
@@ -1100,8 +1266,9 @@ class PluginTools:
                 source=item.source,
                 warnings=item.warnings,
             )
-            for item in self._store.list_evidence(record.run_id)
+            for item in snapshot.evidence
         ]
+        sections = [self._stage_output_result(item) for item in snapshot.outputs]
         return AnalysisResult(
             run_id=record.run_id,
             request_id=record.request_id,
@@ -1117,4 +1284,76 @@ class PluginTools:
             instrument=record.instrument,
             lessons=record.lessons,
             evidence=evidence,
+            active_role=None if stage_view is None else stage_view.active_role,
+            instructions=None if stage_view is None else stage_view.instructions,
+            required_evidence=(
+                []
+                if stage_view is None
+                else [EvidenceCheckResult(**vars(item)) for item in stage_view.required_evidence]
+            ),
+            output_schema=None if stage_view is None else stage_view.output_schema,
+            sections=sections,
+            selected_section=(
+                None if selected_section is None else self._stage_output_result(selected_section)
+            ),
+            evidence_page=evidence_page,
+        )
+
+    @staticmethod
+    def _stage_output_result(record: StageOutputRecord) -> StageOutputResult:
+        return StageOutputResult(
+            receipt_id=record.receipt_id,
+            stage_id=record.stage_id,
+            role_key=record.role_key,
+            output_kind=record.output_kind,
+            canonical_output=record.canonical_output,
+            rendered_output=record.rendered_output,
+            accepted_revision=record.accepted_revision,
+            accepted_at=record.accepted_at,
+        )
+
+    def _submission_result(self, accepted) -> SubmissionResult:
+        return SubmissionResult(
+            run_id=accepted.run_id,
+            status=accepted.status,
+            revision=accepted.revision,
+            current_stage=accepted.current_stage,
+            receipt=self._stage_output_result(accepted.receipt),
+        )
+
+    def _list_result(self, ticker, status, limit, cursor) -> AnalysisListResult:
+        limit = _validate_limit(limit, "limit")
+        ticker = None if ticker is None else _validate_ticker(ticker)
+        before = None if cursor is None else _decode_analysis_cursor(cursor)
+        records = self._store.list_runs(ticker, status, limit + 1, before)
+        page = records[:limit]
+        next_cursor = None
+        if len(records) > limit:
+            last = page[-1]
+            next_cursor = _encode_analysis_cursor(last.created_at, last.run_id)
+        return AnalysisListResult(
+            analyses=[
+                AnalysisSummary(
+                    run_id=record.run_id,
+                    ticker=record.ticker,
+                    analysis_date=record.normalized_inputs["analysis_date"],
+                    status=record.status,
+                    revision=record.revision,
+                    current_stage=record.current_stage,
+                    created_at=record.created_at,
+                    updated_at=record.updated_at,
+                )
+                for record in page
+            ],
+            next_cursor=next_cursor,
+        )
+
+    @staticmethod
+    def _cancellation_result(cancelled) -> CancellationResult:
+        return CancellationResult(
+            run_id=cancelled.run_id,
+            status=cancelled.status,
+            revision=cancelled.revision,
+            current_stage=cancelled.current_stage,
+            changed=cancelled.changed,
         )
