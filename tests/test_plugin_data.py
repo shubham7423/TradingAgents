@@ -209,6 +209,11 @@ def test_list_analyses_rejects_invalid_limits(tools, limit):
         tools.list_analyses(limit=limit)
 
 
+def test_list_analyses_rejects_invalid_status(tools):
+    with pytest.raises(ValueError, match="invalid analysis status"):
+        tools.list_analyses(status="invalid")
+
+
 @pytest.mark.parametrize("cursor", ["bad", "e30=", "eyJjcmVhdGVkX2F0IjoxLCJydW5faWQiOiJ4In0="])
 def test_list_analyses_rejects_malformed_cursors(tools, cursor):
     with pytest.raises(ValueError, match="invalid analysis cursor"):

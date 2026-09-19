@@ -1324,6 +1324,8 @@ class PluginTools:
     def _list_result(self, ticker, status, limit, cursor) -> AnalysisListResult:
         limit = _validate_limit(limit, "limit")
         ticker = None if ticker is None else _validate_ticker(ticker)
+        if status not in {None, "active", "ready_to_finalize", "completed", "cancelled"}:
+            raise ValueError("invalid analysis status")
         before = None if cursor is None else _decode_analysis_cursor(cursor)
         records = self._store.list_runs(ticker, status, limit + 1, before)
         page = records[:limit]
