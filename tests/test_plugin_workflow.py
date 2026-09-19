@@ -45,23 +45,32 @@ def store(tmp_path):
     return PluginStore(tmp_path)
 
 
-def create_run(store, *, analysts=None, stage=None, status="active"):
+def create_run(
+    store,
+    *,
+    analysts=None,
+    stage=None,
+    status="active",
+    research_rounds=1,
+    risk_rounds=1,
+    output_language="English",
+):
     analysts = analysts or ["market"]
     normalized_inputs = {
         "ticker": "AAPL",
         "asset_type": "stock",
         "analysis_date": "2026-09-15",
         "analysts": analysts,
-        "research_rounds": 1,
-        "risk_rounds": 1,
-        "output_language": "English",
+        "research_rounds": research_rounds,
+        "risk_rounds": risk_rounds,
+        "output_language": output_language,
     }
     run, _ = store.create_run(
         request_id=f"request-{stage or analysts[0]}",
         request_hash="request-hash",
         normalized_inputs=normalized_inputs,
         current_stage=stage or f"analyst/{analysts[0]}",
-        frozen_config={"output_language": "English"},
+        frozen_config={"output_language": output_language},
         instrument={
             "requested_symbol": "AAPL",
             "canonical_symbol": "AAPL",
@@ -117,6 +126,29 @@ def save_required_social_evidence(store, run):
             source={},
             warnings=[],
         )
+
+
+def valid_stage_output(stage_id):
+    role = stage_id.split("/")[1] if "/" in stage_id else stage_id
+    return {
+        "social": {
+            "overall_band": "Mixed",
+            "overall_score": 5.0,
+            "confidence": "medium",
+            "narrative": "Saved sources are mixed.",
+        },
+        "manager": {
+            "recommendation": "Hold",
+            "rationale": "The debate is balanced.",
+            "strategic_actions": "Maintain exposure.",
+        },
+        "trader": {"action": "Hold", "reasoning": "Evidence remains balanced."},
+        "portfolio": {
+            "rating": "Hold",
+            "executive_summary": "Maintain the position.",
+            "investment_thesis": "The risk-adjusted outlook is balanced.",
+        },
+    }.get(role, f"{stage_id} saved output")
 
 
 def run_record(*, state_schema=1, prompt_schema=1, stage=None, status="active", **overrides):
@@ -682,3 +714,95 @@ def test_service_cancellation_is_idempotent_and_reports_change(store, status):
         current_stage="portfolio",
         changed=False,
     )
+
+
+def test_complete_multi_round_run_survives_restarts(tmp_path, monkeypatch):
+    from tradingagents import llm_clients
+
+    def reject_llm_client(*args, **kwargs):
+        raise AssertionError("the plugin workflow must not construct an LLM client")
+
+    monkeypatch.setattr(llm_clients, "create_llm_client", reject_llm_client)
+    root = tmp_path / "state"
+    store = PluginStore(root)
+    run = create_run(
+        store,
+        analysts=["market", "social"],
+        research_rounds=2,
+        risk_rounds=2,
+        output_language="French",
+    )
+    save_required_market_snapshot(store, run)
+    service = WorkflowService(store)
+    accepted = service.submit_stage(run.run_id, "analyst/market", 1, "MARKET SAVED")
+
+    reopened = PluginStore(root)
+    save_required_social_evidence(reopened, reopened.get_run(run.run_id))
+    analyst_view = describe_stage(reopened.get_snapshot(run.run_id))
+    assert analyst_view.active_role == "social"
+    assert all(check.satisfied for check in analyst_view.required_evidence)
+    assert "get_news" in analyst_view.instructions
+    assert "French" in analyst_view.instructions
+
+    service = WorkflowService(reopened)
+    accepted = service.submit_stage(
+        run.run_id,
+        accepted.current_stage,
+        accepted.revision,
+        valid_stage_output(accepted.current_stage),
+    )
+    accepted = service.submit_stage(
+        run.run_id,
+        accepted.current_stage,
+        accepted.revision,
+        valid_stage_output(accepted.current_stage),
+    )
+
+    reopened = PluginStore(root)
+    research_view = describe_stage(reopened.get_snapshot(run.run_id))
+    assert research_view.active_role == "bear"
+    assert "research/bull/1 saved output" in research_view.instructions
+    assert "French" in research_view.instructions
+
+    service = WorkflowService(reopened)
+    while not accepted.current_stage.startswith("risk/"):
+        accepted = service.submit_stage(
+            run.run_id,
+            accepted.current_stage,
+            accepted.revision,
+            valid_stage_output(accepted.current_stage),
+        )
+    accepted = service.submit_stage(
+        run.run_id,
+        accepted.current_stage,
+        accepted.revision,
+        valid_stage_output(accepted.current_stage),
+    )
+
+    reopened = PluginStore(root)
+    risk_view = describe_stage(reopened.get_snapshot(run.run_id))
+    assert risk_view.active_role == "conservative"
+    assert "risk/aggressive/1 saved output" in risk_view.instructions
+    assert "French" in risk_view.instructions
+
+    service = WorkflowService(reopened)
+    while accepted.current_stage != "finalize":
+        accepted = service.submit_stage(
+            run.run_id,
+            accepted.current_stage,
+            accepted.revision,
+            valid_stage_output(accepted.current_stage),
+        )
+
+    final = reopened.get_snapshot(run.run_id)
+    research = [item for item in final.outputs if item.stage_id.startswith("research/")]
+    risk = [item for item in final.outputs if item.stage_id.startswith("risk/")]
+
+    assert [item.role_key for item in research[:-1]] == ["bull", "bear", "bull", "bear"]
+    assert [item.role_key for item in risk] == [
+        "aggressive", "conservative", "neutral",
+        "aggressive", "conservative", "neutral",
+    ]
+    assert final.run.status == "ready_to_finalize"
+    assert final.run.current_stage == "finalize"
+    assert final.run.revision == 1 + len(final.outputs)
