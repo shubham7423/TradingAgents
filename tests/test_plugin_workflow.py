@@ -9,7 +9,7 @@ from tradingagents.plugin.store import (
 from tradingagents.plugin.workflow import initial_role_state, next_stage, rebuild_role_state
 
 
-def run_record(**overrides):
+def run_record(*, state_schema=1, prompt_schema=1, **overrides):
     normalized_inputs = {
         "ticker": "AAPL",
         "asset_type": "stock",
@@ -35,8 +35,8 @@ def run_record(**overrides):
             "context": "Apple Inc. (AAPL, NASDAQ, USD)",
         },
         lessons="PAST LESSONS",
-        state_schema=1,
-        prompt_schema=1,
+        state_schema=state_schema,
+        prompt_schema=prompt_schema,
         created_at="2026-09-15T12:00:00+00:00",
         updated_at="2026-09-15T12:00:00+00:00",
     )
@@ -135,6 +135,18 @@ def test_invalid_or_incompatible_stage_is_rejected(stage_id):
         next_stage(run_record(), stage_id)
 
 
+@pytest.mark.parametrize(
+    ("schema_overrides", "message"),
+    [
+        ({"state_schema": 2}, "state schema 2 is not supported; expected 1"),
+        ({"prompt_schema": 2}, "prompt schema 2 is not supported; expected 1"),
+    ],
+)
+def test_next_stage_rejects_unsupported_run_schema(schema_overrides, message):
+    with pytest.raises(IncompatibleState, match=message):
+        next_stage(run_record(**schema_overrides), "analyst/market")
+
+
 def test_initial_role_state_contains_frozen_inputs_and_empty_workflow_state():
     run = run_record()
 
@@ -174,4 +186,23 @@ def test_rebuild_role_state_rejects_noncontiguous_output_sequence():
     snapshot.outputs[1] = stage_output("research/bear/1", "BEAR", 2)
 
     with pytest.raises(IncompatibleState, match="INCOMPATIBLE_STATE"):
+        rebuild_role_state(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("schema_overrides", "message"),
+    [
+        ({"state_schema": 2}, "state schema 2 is not supported; expected 1"),
+        ({"prompt_schema": 2}, "prompt schema 2 is not supported; expected 1"),
+    ],
+)
+def test_rebuild_role_state_rejects_unsupported_run_schema(schema_overrides, message):
+    valid_snapshot = snapshot_with_outputs()
+    snapshot = AnalysisSnapshot(
+        run=run_record(**schema_overrides),
+        outputs=valid_snapshot.outputs,
+        evidence=[],
+    )
+
+    with pytest.raises(IncompatibleState, match=message):
         rebuild_role_state(snapshot)

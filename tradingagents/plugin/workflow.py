@@ -18,6 +18,19 @@ SUPPORTED_STATE_SCHEMA = 1
 SUPPORTED_PROMPT_SCHEMA = 1
 
 
+def _require_compatible_run(run: RunRecord) -> None:
+    if run.state_schema != SUPPORTED_STATE_SCHEMA:
+        raise IncompatibleState(
+            "INCOMPATIBLE_STATE: state schema "
+            f"{run.state_schema} is not supported; expected {SUPPORTED_STATE_SCHEMA}"
+        )
+    if run.prompt_schema != SUPPORTED_PROMPT_SCHEMA:
+        raise IncompatibleState(
+            "INCOMPATIBLE_STATE: prompt schema "
+            f"{run.prompt_schema} is not supported; expected {SUPPORTED_PROMPT_SCHEMA}"
+        )
+
+
 def role_key(stage_id: str) -> str:
     parts = stage_id.split("/")
     if len(parts) == 2 and parts[0] == "analyst" and parts[1] in ANALYST_NODE_SPECS:
@@ -56,6 +69,7 @@ def _round_number(stage_id: str, maximum: object) -> int:
 
 
 def next_stage(run: RunRecord, stage_id: str) -> tuple[str, str]:
+    _require_compatible_run(run)
     inputs = run.normalized_inputs
     analysts = inputs["analysts"]
     if stage_id.startswith("analyst/"):
@@ -147,6 +161,7 @@ _OUTPUT_UPDATES: dict[str, Callable[[Mapping[str, Any], str], dict[str, Any]]] =
 
 
 def rebuild_role_state(snapshot: AnalysisSnapshot) -> dict[str, object]:
+    _require_compatible_run(snapshot.run)
     state = initial_role_state(snapshot.run)
     analysts = snapshot.run.normalized_inputs["analysts"]
     if not analysts:
