@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +16,9 @@ EXPECTED_TOOLS = {
     "get_capabilities",
     "start_analysis",
     "get_analysis",
+    "submit_stage",
+    "list_analyses",
+    "cancel_analysis",
     "get_stock_data",
     "get_indicators",
     "get_verified_market_snapshot",
@@ -31,6 +35,66 @@ EXPECTED_TOOLS = {
     "fetch_stocktwits_messages",
     "fetch_reddit_posts",
 }
+
+
+def test_sdk_executes_and_cancels_workflow(tmp_path, monkeypatch):
+    pytest.importorskip("mcp")
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from tradingagents.plugin import data
+    from tradingagents.plugin.server import create_server
+
+    monkeypatch.setattr(data, "resolve_instrument_identity", lambda ticker: {})
+    monkeypatch.setattr(data.TradingMemoryLog, "get_past_context", lambda *args, **kwargs: "")
+    server = create_server(tmp_path)
+
+    async def invoke():
+        async with create_connected_server_and_client_session(server) as client:
+            started = await client.call_tool("start_analysis", {
+                "request_id": "22222222-2222-4222-8222-222222222222",
+                "ticker": "AAPL",
+                "analysis_date": "2026-09-15",
+                "analysts": ["news"],
+            })
+            run_id = started.structuredContent["run_id"]
+            read = await client.call_tool("get_analysis", {"run_id": run_id})
+            analyst = await client.call_tool("submit_stage", {
+                "run_id": run_id,
+                "stage_id": "analyst/news",
+                "expected_revision": 1,
+                "output": "Saved news analysis.",
+            })
+            stale = await client.call_tool("submit_stage", {
+                "run_id": run_id,
+                "stage_id": "research/bull/1",
+                "expected_revision": 1,
+                "output": "Bull case.",
+            })
+            listed = await client.call_tool("list_analyses", {"status": "active"})
+            cancelled = await client.call_tool("cancel_analysis", {
+                "run_id": run_id,
+                "expected_revision": analyst.structuredContent["revision"],
+            })
+            after_cancel = await client.call_tool("submit_stage", {
+                "run_id": run_id,
+                "stage_id": "research/bull/1",
+                "expected_revision": cancelled.structuredContent["revision"],
+                "output": "Bull case.",
+            })
+            return started, read, analyst, stale, listed, cancelled, after_cancel
+
+    started, read, analyst, stale, listed, cancelled, after_cancel = asyncio.run(invoke())
+
+    assert not started.isError
+    assert read.structuredContent["active_role"] == "news"
+    assert read.structuredContent["instructions"]
+    assert analyst.structuredContent["current_stage"] == "research/bull/1"
+    assert stale.isError
+    assert "STALE_REVISION" in stale.content[0].text
+    assert listed.structuredContent["analyses"][0]["run_id"] == started.structuredContent["run_id"]
+    assert cancelled.structuredContent["status"] == "cancelled"
+    assert after_cancel.isError
+    assert "RUN_CANCELLED" in after_cancel.content[0].text
 
 
 @pytest.mark.parametrize("extra", [
@@ -147,6 +211,8 @@ def test_main_hints_install_when_mcp_is_missing(tmp_path, monkeypatch, capsys):
 
 def test_stdio_protocol_stdout_is_json_rpc(tmp_path):
     pytest.importorskip("mcp")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parents[1])
     process = subprocess.Popen(
         [
             sys.executable,
@@ -160,6 +226,7 @@ def test_stdio_protocol_stdout_is_json_rpc(tmp_path):
         stderr=subprocess.PIPE,
         text=True,
         cwd=tmp_path,
+        env=env,
     )
     deadline = time.monotonic() + 30
     stdout_lines = []

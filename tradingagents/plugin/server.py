@@ -72,11 +72,11 @@ def get_capabilities() -> Capabilities:
     from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
 
     roles = [
-        RoleCapability(key=spec.key, label=spec.agent_node)
+        RoleCapability(key=spec.key, label=spec.agent_node, workflow_available=True)
         for spec in ANALYST_NODE_SPECS.values()
     ]
     roles.extend(
-        RoleCapability(key=key, label=label)
+        RoleCapability(key=key, label=label, workflow_available=key != "reflection")
         for key, label in (
             ("bull", "Bull Analyst"),
             ("bear", "Bear Analyst"),
@@ -109,6 +109,9 @@ def get_capabilities() -> Capabilities:
             "get_capabilities",
             "start_analysis",
             "get_analysis",
+            "submit_stage",
+            "list_analyses",
+            "cancel_analysis",
             "get_stock_data",
             "get_indicators",
             "get_verified_market_snapshot",

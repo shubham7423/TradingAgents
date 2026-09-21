@@ -47,7 +47,7 @@ from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
 
 
-def _seven_days_back(trade_date: str) -> str:
+def sentiment_window_start(trade_date: str) -> str:
     return (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
 
 
@@ -58,7 +58,7 @@ def build_sentiment_prompt(
     """Build the complete sentiment system message from recorded evidence."""
     ticker = state["company_of_interest"]
     end_date = state["trade_date"]
-    start_date = _seven_days_back(end_date)
+    start_date = sentiment_window_start(end_date)
     instrument_context = get_instrument_context_from_state(state)
     return (
         "You are a helpful AI assistant, collaborating with other assistants."
@@ -91,7 +91,7 @@ def create_sentiment_analyst(llm):
     def sentiment_analyst_node(state):
         ticker = state["company_of_interest"]
         end_date = state["trade_date"]
-        start_date = _seven_days_back(end_date)
+        start_date = sentiment_window_start(end_date)
 
         # Pre-fetch all three sources. Each fetcher degrades gracefully and
         # returns a string (no exceptions surface from here), so the LLM

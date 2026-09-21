@@ -30,11 +30,12 @@ The package inherits its `.env` lookup from `python-dotenv`: it searches relativ
 working directory and its ancestors. For launches outside the checkout, export settings in the
 environment instead of depending on a checkout-local `.env` file.
 
-The optional SDK is pinned to `mcp==1.26.0`. The runtime exposes capability discovery, two run
+The optional SDK is pinned to `mcp==1.26.0`. The runtime exposes capability discovery, five run
 lifecycle tools, and fifteen typed data/identity tools:
 
 - Discovery: `get_capabilities`.
-- Lifecycle: `start_analysis`, `get_analysis`.
+- Lifecycle: `start_analysis`, `get_analysis`, `submit_stage`, `list_analyses`, and
+  `cancel_analysis`.
 - Market and fundamentals: `get_stock_data`, `get_indicators`,
   `get_verified_market_snapshot`, `get_fundamentals`, `get_balance_sheet`, `get_cashflow`,
   `get_income_statement`.
@@ -46,11 +47,32 @@ lifecycle tools, and fifteen typed data/identity tools:
 the resolved date, instrument identity, data configuration, analyst order, and lessons. Repeating
 the same UUID with the same normalized request returns the original run; reusing it for a different
 request returns `REQUEST_ID_CONFLICT`. `get_analysis` reads the stored run and evidence metadata
-without network access.
+without network access. It also returns the active role, complete prompt, required-evidence
+checklist, output schema, and accepted section receipts. `list_analyses` finds persisted runs after
+a restart and supports ticker and status filters plus cursor pagination.
 
-Only the first selected analyst stage is active in this milestone. Run-bound calls reject tools,
-symbols, and date windows outside that frozen stage. Stage submission, later-stage progression,
-finalization, decision history, and reflection are not available yet.
+For each active stage, read `get_analysis`, fetch any required evidence through the run-bound data
+tools, reason over the returned prompt, then call `submit_stage` with the current `run_id`,
+`stage_id`, and `expected_revision`. Narrative analyst, bull, bear, and risk outputs must be native
+nonempty strings. Sentiment, research-manager, trader, and portfolio outputs must be native JSON
+objects matching the returned schema. Canonical submissions are limited to 32,000 characters.
+Do not wrap either output kind in Markdown fences or stringify an object.
+
+Market analysis requires a saved `get_verified_market_snapshot` attempt for the frozen symbol and
+analysis date before submission. Sentiment analysis requires saved terminal attempts from
+`get_news`, `fetch_stocktwits_messages`, and `fetch_reddit_posts` for the exact seven-day window
+shown by `get_analysis`. A terminal `success`, `no_data`, or `unavailable` result satisfies the
+gate; retryable errors are not saved and must be retried.
+
+Every accepted submission increments the run revision and advances exactly one stage. Retry an
+identical already-accepted payload to recover its original receipt; a different retry is rejected.
+Use the latest revision for the next submission or for `cancel_analysis`. Cancellation preserves
+evidence and outputs, is idempotent once recorded, and permanently rejects later fetches and
+submissions for that run. Start a new run to resume work after cancellation.
+
+After the portfolio stage, the run becomes `ready_to_finalize` at the `finalize` sentinel.
+`finalize` is not a submittable stage. Report export, decision memory, and completion arrive in
+US-014; this milestone stops at the durable ready-to-finalize state.
 
 Data tools return `status`, `content`, `content_format`, `source`, `warnings`, `fetched_at`,
 `reused`, `retryable`, evidence/run/stage IDs, and a `page` object. Standalone calls are not saved.

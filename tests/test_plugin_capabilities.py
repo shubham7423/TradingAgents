@@ -3,6 +3,7 @@ import importlib
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,9 @@ EXPECTED_TOOLS = {
     "get_capabilities",
     "start_analysis",
     "get_analysis",
+    "submit_stage",
+    "list_analyses",
+    "cancel_analysis",
     "get_stock_data",
     "get_indicators",
     "get_verified_market_snapshot",
@@ -94,7 +98,8 @@ def test_credentials_are_presence_only(monkeypatch):
         "fundamentals",
     ]
     assert result.roles[1].label == "Sentiment Analyst"
-    assert all(not role.workflow_available for role in result.roles)
+    assert all(role.workflow_available for role in result.roles if role.key != "reflection")
+    assert not next(role for role in result.roles if role.key == "reflection").workflow_available
 
 
 def test_empty_and_unrelated_credentials_are_not_discovered(monkeypatch):
@@ -155,6 +160,11 @@ def test_create_server_registers_public_tools(tmp_path):
 
     assert {tool.name for tool in registered} == EXPECTED_TOOLS
     assert all(tool.inputSchema["additionalProperties"] is False for tool in registered)
+    submit = next(tool for tool in registered if tool.name == "submit_stage")
+    assert submit.inputSchema["properties"]["output"]["anyOf"] == [
+        {"type": "string"},
+        {"additionalProperties": True, "type": "object"},
+    ]
 
 
 def test_discovery_imports_without_runner_or_global_config(tmp_path):
@@ -163,6 +173,7 @@ import sys
 from tradingagents.plugin.server import get_capabilities
 expected_tools = {
     "get_capabilities", "start_analysis", "get_analysis",
+    "submit_stage", "list_analyses", "cancel_analysis",
     "get_stock_data", "get_indicators", "get_verified_market_snapshot",
     "get_fundamentals", "get_balance_sheet", "get_cashflow", "get_income_statement",
     "get_news", "get_global_news", "get_insider_transactions",
@@ -177,7 +188,7 @@ assert "tradingagents.plugin.data" not in sys.modules
 assert "tradingagents.plugin.store" not in sys.modules
 '''
     env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
+    env["PYTHONPATH"] = str(Path(__file__).parents[1])
     env["TRADINGAGENTS_TEMPERATURE"] = "invalid-for-api"
 
     result = subprocess.run(

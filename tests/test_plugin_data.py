@@ -8,7 +8,15 @@ from pydantic import ValidationError
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.interface import VendorRouteResult
 from tradingagents.plugin import data
-from tradingagents.plugin.store import PluginStore, RequestIdConflict
+from tradingagents.plugin.store import (
+    IncompatibleState,
+    PluginStore,
+    RequestIdConflict,
+    RunNotFound,
+    StaleRevision,
+    canonical_json,
+    digest_json,
+)
 
 REQUEST_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -49,6 +57,7 @@ def _create_evidence_run(
         request_hash=request_id,
         normalized_inputs={
             "ticker": "AAPL",
+            "asset_type": "stock",
             "analysis_date": analysis_date,
             "analysts": [stage.removeprefix("analyst/")],
             "research_rounds": 1,
@@ -62,7 +71,11 @@ def _create_evidence_run(
             else frozen_config
         ),
         instrument=(
-            {"canonical_symbol": "AAPL", "source": "yfinance"}
+            {
+                "canonical_symbol": "AAPL",
+                "source": "yfinance",
+                "context": "Apple Inc. (AAPL, NASDAQ, USD)",
+            }
             if instrument is None
             else instrument
         ),
@@ -70,6 +83,230 @@ def _create_evidence_run(
         now="2026-09-15T12:00:00+00:00",
     )
     return record
+
+
+def _create_completed_market_stage(store: PluginStore):
+    run = _create_evidence_run(store)
+    store.save_evidence(
+        run_id=run.run_id,
+        expected_stage="analyst/market",
+        tool_name="get_verified_market_snapshot",
+        argument_hash="market-snapshot",
+        arguments={"symbol": "AAPL", "curr_date": "2026-09-15"},
+        status="success",
+        fetched_at="2026-09-15T12:01:00+00:00",
+        requested_window={},
+        content="market snapshot",
+        content_format="text",
+        source={"vendor": "yfinance"},
+        warnings=[],
+    )
+    return run
+
+
+def test_get_analysis_default_section_and_evidence_modes(tools, store):
+    run = _create_completed_market_stage(store)
+    submitted = tools.submit_stage(run.run_id, "analyst/market", 1, "Market report")
+    evidence_id = store.list_evidence(run.run_id)[0].evidence_id
+
+    default = tools.get_analysis(run.run_id)
+    section = tools.get_analysis(run.run_id, section="analyst/market")
+    evidence = tools.get_analysis(run.run_id, evidence_id=evidence_id)
+
+    assert submitted.receipt.rendered_output == "Market report"
+    assert default.active_role == "bull"
+    assert default.instructions
+    assert [item.stage_id for item in default.sections] == ["analyst/market"]
+    assert section.selected_section.rendered_output == "Market report"
+    assert section.instructions is None
+    assert evidence.evidence_page.run_id == run.run_id
+    assert evidence.evidence_page.reused is True
+    assert evidence.instructions is None
+
+
+@pytest.mark.parametrize("field", ["state_schema", "prompt_schema"])
+@pytest.mark.parametrize("mode", ["default", "section", "evidence"])
+def test_get_analysis_rejects_incompatible_run_in_every_mode(tools, store, field, mode):
+    run = _create_completed_market_stage(store)
+    tools.submit_stage(run.run_id, "analyst/market", 1, "Market report")
+    evidence_id = store.list_evidence(run.run_id)[0].evidence_id
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(f"UPDATE runs SET {field} = 2 WHERE run_id = ?", (run.run_id,))
+    kwargs = {
+        "default": {},
+        "section": {"section": "analyst/market"},
+        "evidence": {"evidence_id": evidence_id},
+    }[mode]
+
+    with pytest.raises(IncompatibleState, match="^INCOMPATIBLE_STATE:"):
+        tools.get_analysis(run.run_id, **kwargs)
+
+
+def test_get_analysis_section_uses_only_the_loaded_snapshot(tools, store, monkeypatch):
+    run = _create_completed_market_stage(store)
+    submitted = tools.submit_stage(run.run_id, "analyst/market", 1, "Market report")
+    snapshot = store.get_snapshot(run.run_id)
+    monkeypatch.setattr(store, "get_snapshot", lambda run_id: snapshot)
+    monkeypatch.setattr(
+        store,
+        "get_stage_output",
+        lambda *args: pytest.fail("section read escaped the loaded snapshot"),
+    )
+
+    result = tools.get_analysis(run.run_id, section="analyst/market")
+
+    assert result.revision == snapshot.run.revision
+    assert result.selected_section == result.sections[0]
+    assert result.selected_section.receipt_id == submitted.receipt.receipt_id
+
+
+def test_get_analysis_evidence_uses_only_the_loaded_snapshot(tools, store, monkeypatch):
+    run = _create_completed_market_stage(store)
+    snapshot = store.get_snapshot(run.run_id)
+    evidence = snapshot.evidence[0]
+    monkeypatch.setattr(store, "get_snapshot", lambda run_id: snapshot)
+    monkeypatch.setattr(
+        store,
+        "get_evidence",
+        lambda *args: pytest.fail("evidence read escaped the loaded snapshot"),
+    )
+
+    result = tools.get_analysis(run.run_id, evidence_id=evidence.evidence_id)
+
+    assert result.revision == snapshot.run.revision
+    assert result.evidence_page.evidence_id == result.evidence[0].evidence_id
+    assert result.evidence_page.content == evidence.content
+
+
+def test_get_analysis_rejects_invalid_read_mode_combinations(tools, store):
+    run = _create_completed_market_stage(store)
+    evidence_id = store.list_evidence(run.run_id)[0].evidence_id
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        tools.get_analysis(run.run_id, section="analyst/market", evidence_id=evidence_id)
+    with pytest.raises(ValueError, match="cursor requires evidence_id"):
+        tools.get_analysis(run.run_id, cursor="anything")
+    with pytest.raises(ValueError, match="page_size requires evidence_id"):
+        tools.get_analysis(run.run_id, page_size=100)
+    with pytest.raises(RunNotFound, match="RUN_NOT_FOUND"):
+        tools.get_analysis(run.run_id, section="analyst/market")
+
+
+def test_get_analysis_rejects_cross_run_evidence_and_pages_saved_content(tools, store):
+    first = _create_completed_market_stage(store)
+    second = _create_evidence_run(
+        store,
+        request_id="22222222-2222-4222-8222-222222222222",
+    )
+    evidence_id = store.list_evidence(first.run_id)[0].evidence_id
+
+    with pytest.raises(RunNotFound, match="RUN_NOT_FOUND"):
+        tools.get_analysis(second.run_id, evidence_id=evidence_id)
+
+    record = store.get_evidence(first.run_id, evidence_id)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE evidence SET content = ? WHERE evidence_id = ?",
+            ("x" * 32_001, record.evidence_id),
+        )
+    first_page = tools.get_analysis(first.run_id, evidence_id=evidence_id)
+    second_page = tools.get_analysis(
+        first.run_id,
+        evidence_id=evidence_id,
+        cursor=first_page.evidence_page.page.next_cursor,
+    )
+    assert len(first_page.evidence_page.content) == 32_000
+    assert second_page.evidence_page.content == "x"
+    assert second_page.evidence_page.page.complete is True
+
+
+@pytest.mark.parametrize("status", ["cancelled", "ready_to_finalize"])
+def test_get_analysis_terminal_modes_do_not_build_prompts(tools, store, status):
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE runs SET status = ?, current_stage = 'finalize' WHERE run_id = ?",
+            (status, run.run_id),
+        )
+
+    result = tools.get_analysis(run.run_id)
+
+    assert result.active_role is None
+    assert result.instructions is None
+    assert result.required_evidence == []
+    assert result.output_schema is None
+
+
+def test_list_analyses_filters_and_paginates_without_duplicates(tools, store):
+    first = _create_evidence_run(store)
+    second = _create_evidence_run(
+        store,
+        request_id="22222222-2222-4222-8222-222222222222",
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE runs SET created_at = ?, updated_at = ? WHERE run_id = ?",
+            ("2026-09-16T12:00:00+00:00", "2026-09-16T12:00:00+00:00", second.run_id),
+        )
+
+    page = tools.list_analyses(ticker=" aapl ", status="active", limit=1)
+    following = tools.list_analyses(limit=1, cursor=page.next_cursor)
+
+    assert [item.run_id for item in page.analyses] == [second.run_id]
+    assert [item.run_id for item in following.analyses] == [first.run_id]
+    assert page.analyses[0].ticker == "AAPL"
+    assert following.next_cursor is None
+
+
+@pytest.mark.parametrize("limit", [0, 101, True])
+def test_list_analyses_rejects_invalid_limits(tools, limit):
+    with pytest.raises(ValueError, match="limit must be between 1 and 100"):
+        tools.list_analyses(limit=limit)
+
+
+def test_list_analyses_rejects_invalid_status(tools):
+    with pytest.raises(ValueError, match="invalid analysis status"):
+        tools.list_analyses(status="invalid")
+
+
+@pytest.mark.parametrize("cursor", ["bad", "e30=", "eyJjcmVhdGVkX2F0IjoxLCJydW5faWQiOiJ4In0="])
+def test_list_analyses_rejects_malformed_cursors(tools, cursor):
+    with pytest.raises(ValueError, match="invalid analysis cursor"):
+        tools.list_analyses(cursor=cursor)
+
+
+def test_submit_and_cancel_analysis_return_revisioned_receipts(tools, store):
+    run = _create_completed_market_stage(store)
+
+    submitted = tools.submit_stage(run.run_id, "analyst/market", 1, "Market report")
+    cancelled = tools.cancel_analysis(run.run_id, submitted.revision)
+    repeated = tools.cancel_analysis(run.run_id, 999)
+
+    assert submitted.model_dump() == {
+        "run_id": run.run_id,
+        "status": "active",
+        "revision": 2,
+        "current_stage": "research/bull/1",
+        "receipt": {
+            "receipt_id": submitted.receipt.receipt_id,
+            "stage_id": "analyst/market",
+            "role_key": "market",
+            "output_kind": "text",
+            "canonical_output": "Market report",
+            "rendered_output": "Market report",
+            "accepted_revision": 1,
+            "accepted_at": submitted.receipt.accepted_at,
+        },
+    }
+    assert cancelled.status == "cancelled"
+    assert cancelled.revision == 3
+    assert cancelled.changed is True
+    assert repeated == cancelled.model_copy(update={"changed": False})
+
+    with pytest.raises(StaleRevision, match="STALE_REVISION"):
+        tools.cancel_analysis(_create_evidence_run(
+            store, request_id="33333333-3333-4333-8333-333333333333"
+        ).run_id, 9)
 
 
 def test_start_analysis_defaults_and_freezes_first_stage(tools, monkeypatch):
@@ -154,7 +391,16 @@ def test_get_analysis_uses_only_stored_fields(tools, store, monkeypatch):
     loaded = tools.get_analysis(started.run_id)
 
     assert calls == ["AAPL"]
-    assert loaded.model_dump(exclude={"evidence"}) == started.model_dump(exclude={"evidence"})
+    workflow_fields = {
+        "evidence",
+        "active_role",
+        "instructions",
+        "required_evidence",
+        "output_schema",
+    }
+    assert loaded.model_dump(exclude=workflow_fields) == started.model_dump(
+        exclude=workflow_fields
+    )
     assert loaded.evidence == [
         data.EvidenceMetadata(
             evidence_id=loaded.evidence[0].evidence_id,
@@ -310,8 +556,8 @@ def test_canonical_digest_ignores_mapping_order():
     left = {"ticker": "AAPL", "options": {"b": 2, "a": 1}}
     right = {"options": {"a": 1, "b": 2}, "ticker": "AAPL"}
 
-    assert data._canonical_json(left) == data._canonical_json(right)
-    assert data._digest(left) == data._digest(right)
+    assert canonical_json(left) == canonical_json(right)
+    assert digest_json(left) == digest_json(right)
 
 
 def test_execute_reuses_terminal_evidence(tools, store):
@@ -528,7 +774,7 @@ def test_execute_returns_frozen_identity_without_fetch_or_evidence(tools, store)
         None,
     )
 
-    assert result.content == '{"canonical_symbol":"AAPL","source":"yfinance"}'
+    assert data.json.loads(result.content) == run.instrument
     assert result.content_format == "json"
     assert result.source == "yfinance"
     assert result.reused is True
@@ -1005,7 +1251,7 @@ def test_identity_run_returns_frozen_instrument_without_resolution(tools, store,
 
     result = tools.resolve_instrument_identity("AAPL", run_id=run.run_id)
 
-    assert data.json.loads(result.content) == {"canonical_symbol": "AAPL", "source": "yfinance"}
+    assert data.json.loads(result.content) == run.instrument
     assert result.source == "yfinance"
     assert result.reused is True
 
@@ -1087,7 +1333,7 @@ def test_status_reuse_and_continuation_do_not_construct_llm_or_call_network(
         run_id=run.run_id,
         expected_stage=run.current_stage,
         tool_name="get_stock_data",
-        argument_hash=data._digest(arguments),
+        argument_hash=digest_json(arguments),
         arguments=arguments,
         status="success",
         fetched_at="2026-09-15T12:01:00+00:00",
