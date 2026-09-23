@@ -210,7 +210,7 @@ Each story includes focused automated checks and repository lint. There is no ne
 - [x] A failure after memory write but before completion can be retried without duplicate decisions.
 - [x] Concurrent writes preserve both plugin and existing-runner history; legacy memory entries remain readable.
 - [x] A read-only history tool supports ticker and as-of filtering without exposing arbitrary local files.
-- [x] Export fault-injection, concurrent-memory, legacy-memory, and reporting tests pass; `ruff check .` passes. (Focused suites and Ruff passed; full-suite result is recorded in `docs/user-testing-us-014-016.md`.)
+- [x] Export fault-injection, concurrent-memory, legacy-memory, and reporting tests pass; `ruff check .` passes. (Focused suites, full suite, and Ruff passed; see `docs/user-testing-us-014-016.md`.)
 
 ### US-015: Prepare historical outcomes for reflection
 
@@ -221,7 +221,7 @@ Each story includes focused automated checks and repository lint. There is no ne
 - [x] A job is prepared only when the full required holding window is available and its resolution date is no later than the requested as-of date.
 - [x] Raw return, benchmark-relative return, holding period, benchmark identity, and resolution date are stored with the job.
 - [x] Too-recent or unavailable outcomes leave the decision pending; repeated preparation reuses the existing decision/outcome job.
-- [x] Outcome-window, benchmark, historical-cutoff, and duplicate-preparation tests pass; `ruff check .` passes. (Focused suites and Ruff passed; full-suite result is recorded in `docs/user-testing-us-014-016.md`.)
+- [x] Outcome-window, benchmark, historical-cutoff, and duplicate-preparation tests pass; `ruff check .` passes. (Focused suites, full suite, and Ruff passed; see `docs/user-testing-us-014-016.md`.)
 
 ### US-016: Save and reuse Codex-authored reflections
 
@@ -233,7 +233,7 @@ Each story includes focused automated checks and repository lint. There is no ne
 - [x] Finalization updates the intended decision with outcome fields and reflection exactly once, including for supported legacy entries.
 - [ ] The skill completes eligible same-ticker reflection jobs before starting a new analysis, unless the user explicitly requests analysis without that learning step; such a run records the omission. **Deferred to US-017: automatic skill orchestration is intentionally outside this runtime milestone.**
 - [x] New historical runs include only lessons resolved by their analysis date.
-- [x] Reflection lifecycle/retry/historical-memory tests and `ruff check .` pass. (Focused suites and Ruff passed; full-suite result is recorded in `docs/user-testing-us-014-016.md`.)
+- [x] Reflection lifecycle/retry/historical-memory tests and `ruff check .` pass. (Focused suites, full suite, and Ruff passed; see `docs/user-testing-us-014-016.md`.)
 
 ### US-017: Guide the entire workflow through a skill
 
