@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import isfinite
 from typing import Any
 
 import yfinance as yf
@@ -57,14 +58,19 @@ def calculate_outcome(
         resolution_date = stock.index[holding_sessions].strftime("%Y-%m-%d")
         if as_of_date is not None and resolution_date > as_of_date:
             return None
+        stock_start, stock_end = (
+            float(stock["Close"].iloc[index]) for index in (0, holding_sessions)
+        )
+        benchmark_start, benchmark_end = (
+            float(bench["Close"].iloc[index]) for index in (0, holding_sessions)
+        )
+        prices = (stock_start, stock_end, benchmark_start, benchmark_end)
+        if any(not isfinite(price) or price <= 0 for price in prices):
+            return None
         raw = float(
-            (stock["Close"].iloc[holding_sessions] - stock["Close"].iloc[0])
-            / stock["Close"].iloc[0]
+            (stock_end - stock_start) / stock_start
         )
-        benchmark_return = float(
-            (bench["Close"].iloc[holding_sessions] - bench["Close"].iloc[0])
-            / bench["Close"].iloc[0]
-        )
+        benchmark_return = (benchmark_end - benchmark_start) / benchmark_start
         return Outcome(raw, raw - benchmark_return, holding_sessions, benchmark, resolution_date)
     except Exception as exc:
         logger.warning(

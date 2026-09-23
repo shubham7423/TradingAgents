@@ -99,6 +99,20 @@ def test_resolve_benchmark_prefers_explicit_then_suffix():
     ) == "^N225"
 
 
+@pytest.mark.parametrize("invalid_price", [0, float("nan"), float("inf")])
+def test_calculate_outcome_rejects_invalid_prices(monkeypatch, invalid_price):
+    frames = {
+        "AAPL": _price_df([100, 101, 102, 103, 104, invalid_price]),
+        "SPY": _price_df([400, 401, 402, 403, 404, 420]),
+    }
+    monkeypatch.setattr(
+        "tradingagents.graph.reflection.yf.Ticker",
+        lambda symbol: SimpleNamespace(history=lambda **_: frames[symbol]),
+    )
+
+    assert calculate_outcome("AAPL", "2026-01-05", {}) is None
+
+
 def test_calculate_outcome_rejects_non_five_session_window():
     with pytest.raises(ValueError, match="holding_sessions must be 5"):
         calculate_outcome("AAPL", "2026-01-05", {}, holding_sessions=4)
