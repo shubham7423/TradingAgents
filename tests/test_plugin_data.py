@@ -5,8 +5,10 @@ from threading import Barrier
 import pytest
 from pydantic import ValidationError
 
+from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.interface import VendorRouteResult
+from tradingagents.graph.reflection import Outcome
 from tradingagents.plugin import data
 from tradingagents.plugin.store import (
     IncompatibleState,
@@ -122,6 +124,42 @@ def test_get_analysis_default_section_and_evidence_modes(tools, store):
     assert evidence.evidence_page.run_id == run.run_id
     assert evidence.evidence_page.reused is True
     assert evidence.instructions is None
+
+
+def test_public_reflection_lifecycle_never_constructs_an_llm(tmp_path, monkeypatch):
+    config = {
+        "memory_log_path": str(tmp_path / "memory.md"),
+        "results_dir": str(tmp_path / "results"),
+        "benchmark_ticker": None,
+        "benchmark_map": {"": "SPY"},
+    }
+    memory = TradingMemoryLog(config)
+    memory.store_decision("AAPL", "2026-01-05", "Buy with controlled sizing.",
+                          decision_id="decision-1")
+    monkeypatch.setattr(
+        "tradingagents.plugin.workflow.calculate_outcome",
+        lambda *_args, **_kwargs: Outcome(0.10, 0.05, 5, "SPY", "2026-01-10"),
+    )
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("plugin reflection path must not construct an LLM")
+    monkeypatch.setattr("tradingagents.llm_clients.factory.create_llm_client", unexpected)
+    monkeypatch.setattr("tradingagents.graph.reflection.Reflector", unexpected)
+
+    tools = data.PluginTools(PluginStore(tmp_path / "state"), config)
+    prepared = tools.prepare_reflections("AAPL", "2026-01-10")
+    assert len(prepared.jobs) == 1
+    job_id = prepared.jobs[0].run_id
+    view = tools.get_analysis(job_id)
+    assert view.work_type == "reflection"
+    assert view.active_role == "reflection"
+    assert view.output_schema == {"type": "string", "minLength": 1, "maxLength": 32000}
+    accepted = tools.submit_stage(job_id, "reflection", 1,
+                                  "The call beat SPY. Keep the lesson.")
+    assert accepted.work_type == "reflection"
+    done = tools.finalize_analysis(job_id)
+    assert done.work_type == "reflection"
+    assert done.status == "completed"
+    assert memory.load_entries()[0]["reflection"] == "The call beat SPY. Keep the lesson."
 
 
 @pytest.mark.parametrize("field", ["state_schema", "prompt_schema"])

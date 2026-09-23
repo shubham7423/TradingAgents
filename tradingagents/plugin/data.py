@@ -33,6 +33,7 @@ from tradingagents.dataflows.stocktwits import (
 from tradingagents.dataflows.symbol_utils import NoMarketDataError, crypto_base, normalize_symbol
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
+from tradingagents.graph.reflection import build_reflection_messages
 from tradingagents.plugin.store import (
     AnalysisSnapshot,
     EvidenceRecord,
@@ -43,7 +44,13 @@ from tradingagents.plugin.store import (
     canonical_json,
     digest_json,
 )
-from tradingagents.plugin.workflow import WorkflowService, _require_compatible_run, describe_stage
+from tradingagents.plugin.workflow import (
+    AcceptedReflection,
+    ReflectionFinalization,
+    WorkflowService,
+    _require_compatible_run,
+    describe_stage,
+)
 
 AnalystKey = Literal["market", "social", "news", "fundamentals"]
 AssetType = Literal["stock", "crypto"]
@@ -431,6 +438,7 @@ class AnalysisResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run_id: str
+    work_type: Literal["analysis"] = "analysis"
     request_id: str
     status: Literal["active", "ready_to_finalize", "completed", "cancelled"]
     revision: int
@@ -504,6 +512,53 @@ class SubmissionResult(BaseModel):
     receipt: StageOutputResult
 
 
+class ReflectionOutcomeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    raw_return: float
+    alpha_return: float
+    holding_sessions: Literal[5]
+    benchmark: str
+    resolution_date: str
+
+
+class ReflectionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    work_type: Literal["reflection"] = "reflection"
+    status: Literal["active", "ready_to_finalize", "completed"]
+    revision: int
+    current_stage: str
+    decision_id: str
+    ticker: str
+    decision_date: str
+    decision: str
+    outcome: ReflectionOutcomeResult
+    active_role: Literal["reflection"] | None
+    instructions: list[dict[str, str]] | None
+    output_schema: dict | None
+    reflection: str | None
+
+
+class PreparedReflectionsResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    jobs: list[ReflectionResult]
+    warnings: list[str]
+
+
+class ReflectionSubmissionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    work_type: Literal["reflection"] = "reflection"
+    status: Literal["ready_to_finalize"]
+    revision: int
+    current_stage: Literal["finalize"]
+    reflection: str
+
+
 class CancellationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -528,6 +583,19 @@ class AnalysisFinalizationResult(BaseModel):
     changed: bool
 
 
+class ReflectionFinalizationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    work_type: Literal["reflection"] = "reflection"
+    status: Literal["completed"]
+    revision: int
+    current_stage: Literal["completed"]
+    decision_id: str
+    changed: bool
+    warning: str | None
+
+
 class PluginTools:
     def __init__(self, store: PluginStore, server_config: dict | None = None):
         self._store = store
@@ -542,6 +610,7 @@ class PluginTools:
             self.list_analyses,
             self.cancel_analysis,
             self.finalize_analysis,
+            self.prepare_reflections,
             self.get_stock_data,
             self.get_indicators,
             self.get_verified_market_snapshot,
@@ -1205,8 +1274,16 @@ class PluginTools:
         evidence_id: str | None = None,
         cursor: str | None = None,
         page_size: int | None = None,
-    ) -> AnalysisResult:
-        snapshot = self._store.get_snapshot(run_id)
+    ) -> AnalysisResult | ReflectionResult:
+        try:
+            snapshot = self._store.get_snapshot(run_id)
+        except RunNotFound:
+            job = self._store.get_reflection_job(run_id)
+            if any(value is not None for value in (section, evidence_id, cursor, page_size)):
+                raise ValueError(
+                    "reflection jobs do not support sections or evidence paging"
+                ) from None
+            return self._reflection_result(job)
         if section is not None and evidence_id is not None:
             raise ValueError("section and evidence_id are mutually exclusive")
         if evidence_id is None and cursor is not None:
@@ -1244,10 +1321,11 @@ class PluginTools:
         stage_id: str,
         expected_revision: int,
         output: str | dict,
-    ) -> SubmissionResult:
-        return self._submission_result(
-            self._workflow.submit_stage(run_id, stage_id, expected_revision, output)
-        )
+    ) -> SubmissionResult | ReflectionSubmissionResult:
+        accepted = self._workflow.submit_stage(run_id, stage_id, expected_revision, output)
+        if isinstance(accepted, AcceptedReflection):
+            return ReflectionSubmissionResult(**accepted.__dict__)
+        return self._submission_result(accepted)
 
     def list_analyses(
         self,
@@ -1267,9 +1345,44 @@ class PluginTools:
             self._workflow.cancel_analysis(run_id, expected_revision)
         )
 
-    def finalize_analysis(self, run_id: str) -> AnalysisFinalizationResult:
-        return AnalysisFinalizationResult(
-            **self._workflow.finalize_analysis(run_id).__dict__
+    def finalize_analysis(self, run_id: str) -> AnalysisFinalizationResult | ReflectionFinalizationResult:
+        finalized = self._workflow.finalize_analysis(run_id)
+        if isinstance(finalized, ReflectionFinalization):
+            job = self._store.get_reflection_job(run_id)
+            return ReflectionFinalizationResult(
+                run_id=run_id, status="completed", revision=job.revision,
+                current_stage="completed", decision_id=finalized.decision_id,
+                changed=finalized.changed, warning=finalized.warning,
+            )
+        return AnalysisFinalizationResult(**finalized.__dict__)
+
+    def prepare_reflections(self, ticker: str, as_of_date: str) -> PreparedReflectionsResult:
+        prepared = self._workflow.prepare_reflections(_validate_ticker(ticker),
+                                                      _validate_date(as_of_date, "as_of_date"))
+        return PreparedReflectionsResult(
+            jobs=[self._reflection_result(job) for job in prepared.jobs],
+            warnings=prepared.warnings,
+        )
+
+    @staticmethod
+    def _reflection_result(job) -> ReflectionResult:
+        active = job.status == "active"
+        messages = build_reflection_messages(
+            job.decision_text, job.raw_return, job.alpha_return, job.benchmark
+        )
+        return ReflectionResult(
+            run_id=job.job_id, status=job.status, revision=job.revision,
+            current_stage=job.current_stage, decision_id=job.decision_id,
+            ticker=job.ticker, decision_date=job.decision_date, decision=job.decision_text,
+            outcome=ReflectionOutcomeResult(
+                raw_return=job.raw_return, alpha_return=job.alpha_return,
+                holding_sessions=job.holding_sessions, benchmark=job.benchmark,
+                resolution_date=job.resolution_date,
+            ), active_role="reflection" if active else None,
+            instructions=([{"role": role, "content": content} for role, content in messages]
+                          if active else None),
+            output_schema={"type": "string", "minLength": 1, "maxLength": 32000}
+            if active else None, reflection=job.reflection,
         )
 
     def _analysis_result(

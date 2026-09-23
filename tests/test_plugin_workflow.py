@@ -15,6 +15,7 @@ from tradingagents.agents.schemas import (
 )
 from tradingagents.agents.trader.trader import build_trader_messages
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.graph.reflection import Outcome
 from tradingagents.plugin.store import (
     AnalysisSnapshot,
     EvidenceRecord,
@@ -45,6 +46,78 @@ from tradingagents.plugin.workflow import (
 @pytest.fixture
 def store(tmp_path):
     return PluginStore(tmp_path)
+
+
+def reflection_service(tmp_path):
+    config = {
+        "memory_log_path": str(tmp_path / "memory.md"),
+        "results_dir": str(tmp_path / "results"),
+        "benchmark_ticker": None,
+        "benchmark_map": {"": "SPY"},
+    }
+    store = PluginStore(tmp_path / "state")
+    return WorkflowService(store, config), TradingMemoryLog(config)
+
+
+def test_prepare_reflections_creates_one_reusable_job(tmp_path, monkeypatch):
+    service, memory = reflection_service(tmp_path)
+    memory.store_decision("AAPL", "2026-01-05", "Buy with controlled sizing.",
+                          decision_id="decision-1")
+    monkeypatch.setattr("tradingagents.plugin.workflow.calculate_outcome",
+                        lambda *_args, **_kwargs: Outcome(0.10, 0.05, 5, "SPY", "2026-01-10"))
+    first = service.prepare_reflections("AAPL", "2026-01-10")
+    repeated = service.prepare_reflections("AAPL", "2026-01-10")
+    assert [job.job_id for job in first.jobs] == [job.job_id for job in repeated.jobs]
+    assert first.jobs[0].holding_sessions == 5
+
+
+@pytest.mark.parametrize("outcome", [None, Outcome(0.10, 0.05, 5, "SPY", "2026-01-11")])
+def test_prepare_reflections_skips_unavailable_or_future_outcome(tmp_path, monkeypatch, outcome):
+    service, memory = reflection_service(tmp_path)
+    memory.store_decision("AAPL", "2026-01-05", "Buy with controlled sizing.",
+                          decision_id="decision-1")
+    monkeypatch.setattr("tradingagents.plugin.workflow.calculate_outcome",
+                        lambda *_args, **_kwargs: outcome)
+    assert service.prepare_reflections("AAPL", "2026-01-10").jobs == []
+    assert memory.load_entries()[0]["pending"] is True
+
+
+def test_prepare_reflections_skips_ambiguous_legacy_identity(tmp_path, monkeypatch):
+    service, memory = reflection_service(tmp_path)
+    block = "[2026-01-05 | AAPL | Buy | pending]\n\nDECISION:\nBuy with controlled sizing."
+    Path(memory._log_path).write_text(
+        block + TradingMemoryLog._SEPARATOR + block + TradingMemoryLog._SEPARATOR,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("tradingagents.plugin.workflow.calculate_outcome",
+                        lambda *_args, **_kwargs: Outcome(0.10, 0.05, 5, "SPY", "2026-01-10"))
+    prepared = service.prepare_reflections("AAPL", "2026-01-10")
+    assert prepared.jobs == []
+    assert any("ambiguous legacy identity" in warning for warning in prepared.warnings)
+
+
+def test_reflection_job_dispatch_and_api_resolution_race(tmp_path, monkeypatch):
+    service, memory = reflection_service(tmp_path)
+    memory.store_decision("AAPL", "2026-01-05", "Buy with controlled sizing.",
+                          decision_id="decision-1")
+    monkeypatch.setattr("tradingagents.plugin.workflow.calculate_outcome",
+                        lambda *_args, **_kwargs: Outcome(0.10, 0.05, 5, "SPY", "2026-01-10"))
+    job = service.prepare_reflections("AAPL", "2026-01-10").jobs[0]
+    view = service.describe_work(job.job_id)
+    assert view.active_role == "reflection"
+    assert view.output_schema == {"type": "string", "minLength": 1, "maxLength": 32000}
+    accepted = service.submit_stage(job.job_id, "reflection", 1,
+                                    "The call beat SPY. Keep the lesson.")
+    assert accepted.status == "ready_to_finalize"
+    memory.resolve_decision(
+        decision_id="decision-1", ticker="AAPL", trade_date="2026-01-05",
+        raw_return=0.10, alpha_return=0.05, holding_days=5, benchmark_name="SPY",
+        resolution_date="2026-01-10", reflection="API runner reflection",
+    )
+    done = service.finalize_analysis(job.job_id)
+    assert done.changed is False
+    assert done.warning == "ALREADY_RESOLVED"
+    assert memory.load_entries()[0]["reflection"] == "API runner reflection"
 
 
 def create_run(

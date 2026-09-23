@@ -50,11 +50,14 @@ from tradingagents.agents.trader.trader import apply_trader_output, build_trader
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import get_config
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
+from tradingagents.graph.reflection import build_reflection_messages, calculate_outcome
 from tradingagents.plugin.store import (
     AnalysisSnapshot,
     EvidenceRequirement,
     IncompatibleState,
     PluginStore,
+    ReflectionJobRecord,
+    RunNotFound,
     RunRecord,
     StageOutputRecord,
     canonical_json,
@@ -104,6 +107,15 @@ class AcceptedStage:
 
 
 @dataclass(frozen=True)
+class AcceptedReflection:
+    run_id: str
+    status: Literal["ready_to_finalize"]
+    revision: int
+    current_stage: Literal["finalize"]
+    reflection: str
+
+
+@dataclass(frozen=True)
 class CancelledAnalysis:
     run_id: str
     status: Literal["cancelled"]
@@ -124,6 +136,21 @@ class AnalysisFinalization:
     changed: bool
 
 
+@dataclass(frozen=True)
+class PreparedReflections:
+    jobs: list[ReflectionJobRecord]
+    warnings: list[str]
+
+
+@dataclass(frozen=True)
+class ReflectionFinalization:
+    run_id: str
+    status: Literal["completed"]
+    decision_id: str
+    changed: bool
+    warning: str | None
+
+
 class StageValidationError(ValueError):
     def __init__(self, message: str, errors: list[dict] | None = None):
         super().__init__(f"VALIDATION_ERROR: {message}")
@@ -135,13 +162,84 @@ class WorkflowService:
         self._store = store
         self._server_config = deepcopy(server_config if server_config is not None else get_config())
 
+    def prepare_reflections(self, ticker: str, as_of_date: str) -> PreparedReflections:
+        from datetime import date
+
+        ticker = ticker.strip().upper()
+        cutoff = date.fromisoformat(as_of_date).isoformat()
+        memory = TradingMemoryLog(self._server_config)
+        entries, warnings = memory.get_history(ticker)
+        ambiguous = {warning.removeprefix("ambiguous legacy identity: ")
+                     for warning in warnings if warning.startswith("ambiguous legacy identity:")}
+        jobs = []
+        for entry in entries:
+            if not entry["pending"] or entry["date"] > cutoff:
+                continue
+            if entry["legacy_identity"] and entry["decision_id"] in ambiguous:
+                continue
+            outcome = calculate_outcome(
+                ticker, entry["date"], self._server_config, as_of_date=cutoff
+            )
+            if outcome is None or outcome.resolution_date > cutoff:
+                continue
+            latest, _ = memory.get_history(ticker)
+            current = [item for item in latest if item["decision_id"] == entry["decision_id"]]
+            if len(current) != 1 or not current[0]["pending"]:
+                continue
+            job, _ = self._store.create_reflection_job(
+                decision_id=entry["decision_id"], ticker=entry["ticker"],
+                decision_date=entry["date"], rating=entry["rating"],
+                decision_text=entry["decision"], raw_return=outcome.raw_return,
+                alpha_return=outcome.alpha_return, holding_sessions=outcome.holding_sessions,
+                benchmark=outcome.benchmark, resolution_date=outcome.resolution_date,
+                now=datetime.now(timezone.utc).isoformat(),
+            )
+            jobs.append(job)
+        return PreparedReflections(jobs, warnings)
+
+    def describe_work(self, run_id: str):
+        try:
+            snapshot = self._store.get_snapshot(run_id)
+            return describe_stage(snapshot)
+        except RunNotFound:
+            job = self._store.get_reflection_job(run_id)
+            active = job.status == "active"
+            return StageView(
+                active_role="reflection" if active else None,
+                instructions=(
+                    [{"role": role, "content": content} for role, content in
+                     build_reflection_messages(job.decision_text, job.raw_return,
+                                               job.alpha_return, job.benchmark)]
+                    if active else None
+                ),
+                required_evidence=[],
+                output_schema={"type": "string", "minLength": 1, "maxLength": 32000}
+                if active else None,
+            )
+
     def submit_stage(
         self,
         run_id: str,
         stage_id: str,
         expected_revision: int,
         output: object,
-    ) -> AcceptedStage:
+    ) -> AcceptedStage | AcceptedReflection:
+        try:
+            self._store.get_snapshot(run_id)
+        except RunNotFound:
+            self._store.get_reflection_job(run_id)
+            if stage_id != "reflection":
+                raise IncompatibleState("WRONG_STAGE: reflection jobs accept only reflection") from None
+            if not isinstance(output, str) or not output.strip():
+                raise StageValidationError("reflection must be a nonblank string") from None
+            if len(output) > MAX_SUBMISSION_SIZE:
+                raise StageValidationError("reflection exceeds 32,000 characters") from None
+            accepted, _ = self._store.accept_reflection(
+                job_id=run_id, expected_revision=expected_revision, reflection=output,
+                reflection_hash=digest_json(output), now=datetime.now(timezone.utc).isoformat(),
+            )
+            return AcceptedReflection(accepted.job_id, accepted.status, accepted.revision,
+                                     "finalize", accepted.reflection)
         snapshot = self._store.get_snapshot(run_id)
         _require_compatible_run(snapshot.run)
         prepared = prepare_output(stage_id, output)
@@ -183,7 +281,7 @@ class WorkflowService:
             changed=changed,
         )
 
-    def finalize_analysis(self, run_id: str) -> AnalysisFinalization:
+    def finalize_analysis(self, run_id: str) -> AnalysisFinalization | ReflectionFinalization:
         receipt = self._store.get_export_receipt(run_id)
         if receipt is not None:
             return AnalysisFinalization(
@@ -193,7 +291,35 @@ class WorkflowService:
                 section_paths=receipt.section_paths, changed=False,
             )
 
-        snapshot = self._store.get_snapshot(run_id)
+        try:
+            snapshot = self._store.get_snapshot(run_id)
+        except RunNotFound:
+            job = self._store.get_reflection_job(run_id)
+            if job.status == "completed":
+                return ReflectionFinalization(job.job_id, "completed", job.decision_id,
+                                              bool(job.changed), job.warning)
+            if job.status != READY_TO_FINALIZE or job.reflection is None:
+                raise IncompatibleState(
+                    f"RUN_NOT_READY: reflection job {run_id} is not ready"
+                ) from None
+            status = TradingMemoryLog(self._server_config).resolve_decision(
+                decision_id=job.decision_id, ticker=job.ticker, trade_date=job.decision_date,
+                raw_return=job.raw_return, alpha_return=job.alpha_return,
+                holding_days=job.holding_sessions, benchmark_name=job.benchmark,
+                resolution_date=job.resolution_date, reflection=job.reflection,
+            )
+            if status in {"missing", "ambiguous"}:
+                raise IncompatibleState(
+                    f"MEMORY_{status.upper()}: decision cannot be resolved"
+                ) from None
+            changed = status == "updated"
+            warning = "ALREADY_RESOLVED" if status == "already_resolved" else None
+            completed, _ = self._store.complete_reflection(
+                job_id=run_id, changed=changed, warning=warning,
+                now=datetime.now(timezone.utc).isoformat(),
+            )
+            return ReflectionFinalization(completed.job_id, "completed", completed.decision_id,
+                                          bool(completed.changed), completed.warning)
         run = snapshot.run
         if run.status != READY_TO_FINALIZE:
             raise IncompatibleState(
