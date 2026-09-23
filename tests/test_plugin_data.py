@@ -1602,3 +1602,30 @@ def test_error_diagnostics_redact_request_urls_and_keys(tools, store, monkeypatc
     assert secret not in result.model_dump_json()
     assert "https://" not in result.model_dump_json()
     assert store.list_evidence(run.run_id) == []
+
+
+def test_finalize_analysis_is_public_and_strict(store, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        data.WorkflowService,
+        "finalize_analysis",
+        lambda _self, run_id: SimpleNamespace(
+            run_id=run_id,
+            status="completed",
+            decision_id=run_id,
+            rating="Hold",
+            report_dir="/reports/run",
+            complete_report_path="/reports/run/complete_report.md",
+            section_paths=["/reports/run/complete_report.md"],
+            changed=True,
+        ),
+    )
+    tools = data.PluginTools(store)
+    result = tools.finalize_analysis("run-1")
+
+    assert result.work_type == "analysis"
+    assert result.decision_id == "run-1"
+    assert tools.finalize_analysis in tools.public_operations()
+    with pytest.raises(ValidationError):
+        data.AnalysisFinalizationResult.model_validate({**result.model_dump(), "extra": True})

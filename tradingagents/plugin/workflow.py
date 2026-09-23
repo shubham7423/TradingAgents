@@ -1,6 +1,8 @@
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import ValidationError
@@ -45,6 +47,8 @@ from tradingagents.agents.schemas import (
     render_trader_proposal,
 )
 from tradingagents.agents.trader.trader import apply_trader_output, build_trader_messages
+from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.dataflows.config import get_config
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
 from tradingagents.plugin.store import (
     AnalysisSnapshot,
@@ -56,6 +60,7 @@ from tradingagents.plugin.store import (
     canonical_json,
     digest_json,
 )
+from tradingagents.reporting import write_report_tree
 
 ACTIVE = "active"
 READY_TO_FINALIZE = "ready_to_finalize"
@@ -107,6 +112,18 @@ class CancelledAnalysis:
     changed: bool
 
 
+@dataclass(frozen=True)
+class AnalysisFinalization:
+    run_id: str
+    status: Literal["completed"]
+    decision_id: str
+    rating: str
+    report_dir: str
+    complete_report_path: str
+    section_paths: list[str]
+    changed: bool
+
+
 class StageValidationError(ValueError):
     def __init__(self, message: str, errors: list[dict] | None = None):
         super().__init__(f"VALIDATION_ERROR: {message}")
@@ -114,8 +131,9 @@ class StageValidationError(ValueError):
 
 
 class WorkflowService:
-    def __init__(self, store: PluginStore):
+    def __init__(self, store: PluginStore, server_config: dict | None = None):
         self._store = store
+        self._server_config = deepcopy(server_config if server_config is not None else get_config())
 
     def submit_stage(
         self,
@@ -163,6 +181,51 @@ class WorkflowService:
             revision=run.revision,
             current_stage=run.current_stage,
             changed=changed,
+        )
+
+    def finalize_analysis(self, run_id: str) -> AnalysisFinalization:
+        receipt = self._store.get_export_receipt(run_id)
+        if receipt is not None:
+            return AnalysisFinalization(
+                run_id=receipt.run_id, status="completed", decision_id=receipt.decision_id,
+                rating=receipt.rating, report_dir=receipt.report_dir,
+                complete_report_path=receipt.complete_report_path,
+                section_paths=receipt.section_paths, changed=False,
+            )
+
+        snapshot = self._store.get_snapshot(run_id)
+        run = snapshot.run
+        if run.status != READY_TO_FINALIZE:
+            raise IncompatibleState(
+                f"RUN_NOT_READY: analysis {run_id} has status {run.status}"
+            )
+        state = rebuild_role_state(snapshot)
+        portfolio = next((item for item in snapshot.outputs if item.stage_id == "portfolio"), None)
+        if portfolio is None or not isinstance(portfolio.canonical_output, dict):
+            raise IncompatibleState("INCOMPATIBLE_STATE: portfolio decision is missing")
+        rating = portfolio.canonical_output.get("rating")
+        if not isinstance(rating, str) or not rating:
+            raise IncompatibleState("INCOMPATIBLE_STATE: portfolio rating is invalid")
+
+        report_dir = Path(self._server_config.get("results_dir", "results")) / "plugin" / run_id
+        complete_path = write_report_tree(
+            state, run.ticker, report_dir, generated_at=datetime.fromisoformat(run.created_at)
+        )
+        section_paths = sorted(str(path) for path in report_dir.rglob("*.md"))
+        analysis_date = run.normalized_inputs["analysis_date"]
+        TradingMemoryLog(self._server_config).store_decision(
+            run.ticker, analysis_date, state["final_trade_decision"], decision_id=run_id
+        )
+        export, changed = self._store.complete_analysis_export(
+            run_id=run_id, decision_id=run_id, report_dir=str(report_dir),
+            complete_report_path=str(complete_path), section_paths=section_paths,
+            rating=rating, now=datetime.now(timezone.utc).isoformat(),
+        )
+        return AnalysisFinalization(
+            run_id=export.run_id, status="completed", decision_id=export.decision_id,
+            rating=export.rating, report_dir=export.report_dir,
+            complete_report_path=export.complete_report_path,
+            section_paths=export.section_paths, changed=changed,
         )
 
 

@@ -1,4 +1,5 @@
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from tradingagents.agents.schemas import (
     TraderProposal,
 )
 from tradingagents.agents.trader.trader import build_trader_messages
+from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.plugin.store import (
     AnalysisSnapshot,
     EvidenceRecord,
@@ -806,3 +808,74 @@ def test_complete_multi_round_run_survives_restarts(tmp_path, monkeypatch):
     assert final.run.status == "ready_to_finalize"
     assert final.run.current_stage == "finalize"
     assert final.run.revision == 1 + len(final.outputs)
+
+
+def _ready_analysis(store, config):
+    run = create_run(store, analysts=["news"])
+    service = WorkflowService(store, config)
+    while run.current_stage != "finalize":
+        service.submit_stage(
+            run.run_id, run.current_stage, run.revision, valid_stage_output(run.current_stage)
+        )
+        run = store.get_run(run.run_id)
+    return run, service
+
+
+def test_finalize_analysis_writes_report_memory_and_receipt(store, tmp_path):
+    config = {
+        "results_dir": str(tmp_path / "results"),
+        "memory_log_path": str(tmp_path / "memory.md"),
+    }
+    run, service = _ready_analysis(store, config)
+
+    result = service.finalize_analysis(run.run_id)
+
+    assert result.rating == "Hold"
+    assert result.decision_id == run.run_id
+    assert Path(result.complete_report_path).exists()
+    assert store.get_run(run.run_id).status == "completed"
+    assert TradingMemoryLog(config).load_entries()[0]["decision_id"] == run.run_id
+    assert service.finalize_analysis(run.run_id).changed is False
+
+
+def test_finalize_analysis_retries_after_memory_insert_without_duplicate(store, tmp_path):
+    config = {
+        "results_dir": str(tmp_path / "results"),
+        "memory_log_path": str(tmp_path / "memory.md"),
+    }
+    run, service = _ready_analysis(store, config)
+    complete = store.complete_analysis_export
+
+    def fail_once(**kwargs):
+        store.complete_analysis_export = complete
+        raise RuntimeError("injected")
+
+    store.complete_analysis_export = fail_once
+    with pytest.raises(RuntimeError, match="injected"):
+        service.finalize_analysis(run.run_id)
+    memory = TradingMemoryLog(config)
+    assert len(memory.load_entries()) == 1
+
+    result = service.finalize_analysis(run.run_id)
+    assert len(memory.load_entries()) == 1
+    assert store.get_run(run.run_id).status == "completed"
+    assert result.decision_id == run.run_id
+
+
+def test_finalize_analysis_report_failure_leaves_run_retryable(store, tmp_path, monkeypatch):
+    config = {
+        "results_dir": str(tmp_path / "results"),
+        "memory_log_path": str(tmp_path / "memory.md"),
+    }
+    run, service = _ready_analysis(store, config)
+
+    def fail_report(*_args, **_kwargs):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr("tradingagents.plugin.workflow.write_report_tree", fail_report)
+    with pytest.raises(RuntimeError, match="injected"):
+        service.finalize_analysis(run.run_id)
+
+    assert store.get_run(run.run_id).status == "ready_to_finalize"
+    assert store.get_export_receipt(run.run_id) is None
+    assert TradingMemoryLog(config).load_entries() == []

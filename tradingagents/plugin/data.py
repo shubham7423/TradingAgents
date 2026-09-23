@@ -514,11 +514,25 @@ class CancellationResult(BaseModel):
     changed: bool
 
 
+class AnalysisFinalizationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    work_type: Literal["analysis"] = "analysis"
+    status: Literal["completed"]
+    rating: str
+    decision_id: str
+    report_dir: str
+    complete_report_path: str
+    section_paths: list[str]
+    changed: bool
+
+
 class PluginTools:
     def __init__(self, store: PluginStore, server_config: dict | None = None):
         self._store = store
-        self._workflow = WorkflowService(store)
         self._server_config = deepcopy(server_config if server_config is not None else get_config())
+        self._workflow = WorkflowService(store, self._server_config)
 
     def public_operations(self) -> tuple[Callable[..., object], ...]:
         return (
@@ -527,6 +541,7 @@ class PluginTools:
             self.submit_stage,
             self.list_analyses,
             self.cancel_analysis,
+            self.finalize_analysis,
             self.get_stock_data,
             self.get_indicators,
             self.get_verified_market_snapshot,
@@ -1250,6 +1265,11 @@ class PluginTools:
     ) -> CancellationResult:
         return self._cancellation_result(
             self._workflow.cancel_analysis(run_id, expected_revision)
+        )
+
+    def finalize_analysis(self, run_id: str) -> AnalysisFinalizationResult:
+        return AnalysisFinalizationResult(
+            **self._workflow.finalize_analysis(run_id).__dict__
         )
 
     def _analysis_result(
