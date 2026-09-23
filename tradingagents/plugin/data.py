@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
@@ -1449,13 +1450,34 @@ class PluginTools:
         page = indexed[start:start + limit]
         entries = []
         for entry, _, _ in page:
+            try:
+                raw_return = (
+                    None if entry["pending"] or not entry["raw"]
+                    else float(entry["raw"].rstrip("%")) / 100
+                )
+                alpha_return = (
+                    None if entry["pending"] or not entry["alpha"]
+                    else float(entry["alpha"].rstrip("%")) / 100
+                )
+                holding_sessions = (
+                    None if entry["pending"] or not entry["holding"]
+                    else int(entry["holding"].rstrip("d"))
+                )
+                if any(
+                    value is not None and not math.isfinite(value)
+                    for value in (raw_return, alpha_return)
+                ):
+                    raise ValueError
+            except (TypeError, ValueError):
+                warnings.append("malformed memory entry outcome metadata")
+                continue
             entries.append(DecisionHistoryEntry(
                 decision_id=entry["decision_id"], decision_date=entry["date"],
                 ticker=entry["ticker"], rating=entry["rating"], pending=entry["pending"],
                 decision=entry["decision"],
-                raw_return=None if entry["pending"] or not entry["raw"] else float(entry["raw"].rstrip("%")) / 100,
-                alpha_return=None if entry["pending"] or not entry["alpha"] else float(entry["alpha"].rstrip("%")) / 100,
-                holding_sessions=None if entry["pending"] or not entry["holding"] else int(entry["holding"].rstrip("d")),
+                raw_return=raw_return,
+                alpha_return=alpha_return,
+                holding_sessions=holding_sessions,
                 benchmark=entry["benchmark"] or None,
                 resolution_date=entry["resolved"] or None,
                 reflection=entry["reflection"] or None,

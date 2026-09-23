@@ -418,6 +418,27 @@ def test_history_rejects_path_like_unknown_arguments(tools):
         tools.get_decision_history(path="/tmp/secret")
 
 
+def test_history_skips_entries_with_malformed_outcome_metadata(tmp_path):
+    memory_path = tmp_path / "memory.md"
+    config = {"memory_log_path": str(memory_path)}
+    memory = TradingMemoryLog(config)
+    memory.store_decision("AAPL", "2026-01-05", "First", decision_id="aapl-1")
+    memory.resolve_decision(
+        decision_id="aapl-1", ticker="AAPL", trade_date="2026-01-05",
+        raw_return=0.10, alpha_return=0.05, holding_days=5, benchmark_name="SPY",
+        resolution_date="2026-01-10", reflection="Lesson.",
+    )
+    memory_path.write_text(
+        memory_path.read_text(encoding="utf-8").replace("+10.0%", "oops"),
+        encoding="utf-8",
+    )
+
+    result = data.PluginTools(PluginStore(tmp_path / "state"), server_config=config).get_decision_history()
+
+    assert result.entries == []
+    assert "malformed memory entry outcome metadata" in result.warnings
+
+
 def test_start_analysis_is_idempotent_for_normalized_inputs(tools, store, monkeypatch):
     _stub_identity_and_date(monkeypatch)
 
