@@ -16,6 +16,7 @@ from tradingagents.plugin.store import (
     StaleRevision,
     StaleRun,
     WrongStage,
+    digest_json,
 )
 
 
@@ -122,6 +123,80 @@ def _create_v1_database(path):
     return run_id, evidence_id
 
 
+def _create_v2_database(path):
+    run_id = "11111111-1111-4111-8111-111111111111"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                request_hash TEXT NOT NULL, normalized_inputs_json TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('active','ready_to_finalize','completed','cancelled')),
+                revision INTEGER NOT NULL, current_stage TEXT NOT NULL,
+                frozen_config_json TEXT NOT NULL, instrument_json TEXT NOT NULL,
+                lessons TEXT NOT NULL, state_schema INTEGER NOT NULL,
+                prompt_schema INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE evidence (
+                evidence_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(run_id),
+                stage_id TEXT NOT NULL, tool_name TEXT NOT NULL, argument_hash TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('success','no_data','unavailable')),
+                fetched_at TEXT NOT NULL, requested_window_json TEXT NOT NULL, content TEXT NOT NULL,
+                content_format TEXT NOT NULL CHECK (content_format IN ('text','json')),
+                source_json TEXT NOT NULL, warnings_json TEXT NOT NULL,
+                UNIQUE (run_id, stage_id, tool_name, argument_hash)
+            );
+            CREATE TABLE stage_outputs (
+                receipt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(run_id),
+                stage_id TEXT NOT NULL, role_key TEXT NOT NULL,
+                output_kind TEXT NOT NULL CHECK (output_kind IN ('text','structured')),
+                canonical_output_json TEXT NOT NULL, rendered_output TEXT NOT NULL,
+                output_hash TEXT NOT NULL, accepted_revision INTEGER NOT NULL,
+                accepted_at TEXT NOT NULL, UNIQUE (run_id, stage_id)
+            );
+            CREATE INDEX idx_stage_outputs_run_revision ON stage_outputs(run_id, accepted_revision);
+            CREATE INDEX idx_runs_listing ON runs(status, ticker, created_at DESC, run_id DESC);
+            INSERT INTO metadata VALUES ('schema_version', '2');
+            """
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?, 'hash', ?, 'AAPL', 'active', 1, 'analyst/market', "
+            "'{}', '{}', '', 1, 1, ?, ?)",
+            (run_id, "33333333-3333-4333-8333-333333333333", '{"ticker":"AAPL"}',
+             "2026-09-15T12:00:00+00:00", "2026-09-15T12:00:00+00:00"),
+        )
+    return path, run_id
+
+
+def reflection_job_values(decision_id="decision-1"):
+    return {
+        "decision_id": decision_id, "ticker": "AAPL", "decision_date": "2026-01-05",
+        "rating": "Buy", "decision_text": "Buy with controlled sizing.",
+        "raw_return": 0.10, "alpha_return": 0.05, "holding_sessions": 5,
+        "benchmark": "SPY", "resolution_date": "2026-01-10",
+        "now": "2026-01-10T12:00:00+00:00",
+    }
+
+
+def ready_run(store):
+    run, _ = store.create_run(**run_values())
+    _set_run_fields(store, run.run_id, status="ready_to_finalize", current_stage="finalize")
+    return store.get_run(run.run_id)
+
+
+def export_values(run_id):
+    return {
+        "run_id": run_id, "decision_id": run_id,
+        "report_dir": f"/results/plugin/{run_id}",
+        "complete_report_path": f"/results/plugin/{run_id}/complete_report.md",
+        "section_paths": [f"/results/plugin/{run_id}/5_portfolio/decision.md"],
+        "rating": "Hold", "now": "2026-01-10T12:00:00+00:00",
+    }
+
+
 def test_create_run_is_idempotent_and_survives_restart(tmp_path):
     store = PluginStore(tmp_path)
     first, first_created = store.create_run(**run_values())
@@ -214,7 +289,7 @@ def test_incompatible_schema_is_rejected_without_mutation(tmp_path):
 
     with pytest.raises(
         IncompatibleState,
-        match="INCOMPATIBLE_STATE: database schema 999 is not supported; expected 2",
+        match="INCOMPATIBLE_STATE: database schema 999 is not supported; expected 3",
     ):
         PluginStore(tmp_path)
 
@@ -239,7 +314,71 @@ def test_v1_database_migrates_without_losing_run_or_evidence(tmp_path):
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='schema_version'"
-        ).fetchone()[0] == "2"
+        ).fetchone()[0] == "3"
+
+
+def test_v2_database_migrates_to_export_and_reflection_tables(tmp_path):
+    database, run_id = _create_v2_database(tmp_path / "plugin.sqlite3")
+    store = PluginStore(tmp_path)
+    assert store.get_run(run_id).run_id == run_id
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone()[0] == "3"
+        names = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+    assert {"export_receipts", "reflection_jobs"} <= names
+
+
+def test_reflection_job_is_unique_by_decision_and_survives_restart(tmp_path):
+    store = PluginStore(tmp_path)
+    values = reflection_job_values(decision_id="legacy-1")
+    first, created = store.create_reflection_job(**values)
+    repeated, repeated_created = store.create_reflection_job(**values)
+    assert created is True and repeated_created is False
+    assert repeated == first == PluginStore(tmp_path).get_reflection_job(first.job_id)
+
+
+def test_reflection_transitions_are_atomic_and_idempotent(tmp_path):
+    store = PluginStore(tmp_path)
+    job, _ = store.create_reflection_job(**reflection_job_values())
+    reflection = "The thesis was sound, but sizing was too aggressive."
+    values = {
+        "job_id": job.job_id, "expected_revision": 1, "reflection": reflection,
+        "reflection_hash": digest_json(reflection), "now": "2026-01-10T12:01:00+00:00",
+    }
+    accepted, created = store.accept_reflection(**values)
+    repeated, repeated_created = store.accept_reflection(**values)
+    assert created is True and repeated_created is False
+    assert accepted.status == "ready_to_finalize" and accepted.revision == 2
+    assert repeated == accepted
+    with pytest.raises(StageAlreadyAccepted):
+        store.accept_reflection(**(values | {"reflection": "different", "reflection_hash": digest_json("different")}))
+    stale_job, _ = store.create_reflection_job(**reflection_job_values("decision-2"))
+    with pytest.raises(StaleRevision):
+        store.accept_reflection(**(values | {"expected_revision": 2, "job_id": stale_job.job_id}))
+    completed, changed = store.complete_reflection(
+        job_id=job.job_id, changed=False, warning="already resolved",
+        now="2026-01-10T12:02:00+00:00",
+    )
+    retried, retry_changed = store.complete_reflection(
+        job_id=job.job_id, changed=True, warning=None, now="2026-01-10T12:03:00+00:00"
+    )
+    assert changed is True and retry_changed is False
+    assert completed.status == "completed" and completed.changed is False
+    assert retried == completed
+
+
+def test_complete_analysis_export_is_atomic_and_idempotent(tmp_path):
+    store = PluginStore(tmp_path)
+    run = ready_run(store)
+    values = export_values(run.run_id)
+    first, created = store.complete_analysis_export(**values)
+    repeated, repeated_created = store.complete_analysis_export(**values)
+    assert created is True and repeated_created is False
+    assert repeated == first == store.get_export_receipt(run.run_id)
+    assert store.get_run(run.run_id).status == "completed"
 
 
 def test_snapshot_and_stage_output_reads_are_run_scoped(tmp_path):

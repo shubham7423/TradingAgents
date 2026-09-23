@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class RequestIdConflict(RuntimeError):
@@ -109,6 +109,42 @@ class AnalysisSnapshot:
 
 
 @dataclass(frozen=True)
+class ExportReceipt:
+    run_id: str
+    decision_id: str
+    report_dir: str
+    complete_report_path: str
+    section_paths: list[str]
+    rating: str
+    completed_at: str
+
+
+@dataclass(frozen=True)
+class ReflectionJobRecord:
+    job_id: str
+    decision_id: str
+    ticker: str
+    decision_date: str
+    rating: str
+    decision_text: str
+    raw_return: float
+    alpha_return: float
+    holding_sessions: int
+    benchmark: str
+    resolution_date: str
+    status: str
+    revision: int
+    current_stage: str
+    reflection: str | None
+    reflection_hash: str | None
+    changed: bool | None
+    warning: str | None
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+
+
+@dataclass(frozen=True)
 class EvidenceRequirement:
     tool_name: str
     arguments: dict[str, object]
@@ -175,6 +211,30 @@ def _stage_output_record(row: sqlite3.Row) -> StageOutputRecord:
     )
 
 
+def _export_receipt(row: sqlite3.Row) -> ExportReceipt:
+    return ExportReceipt(
+        run_id=row["run_id"], decision_id=row["decision_id"],
+        report_dir=row["report_dir"], complete_report_path=row["complete_report_path"],
+        section_paths=json.loads(row["section_paths_json"]), rating=row["rating"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _reflection_job(row: sqlite3.Row) -> ReflectionJobRecord:
+    return ReflectionJobRecord(
+        job_id=row["job_id"], decision_id=row["decision_id"], ticker=row["ticker"],
+        decision_date=row["decision_date"], rating=row["rating"],
+        decision_text=row["decision_text"], raw_return=row["raw_return"],
+        alpha_return=row["alpha_return"], holding_sessions=row["holding_sessions"],
+        benchmark=row["benchmark"], resolution_date=row["resolution_date"],
+        status=row["status"], revision=row["revision"], current_stage=row["current_stage"],
+        reflection=row["reflection"], reflection_hash=row["reflection_hash"],
+        changed=None if row["changed"] is None else bool(row["changed"]),
+        warning=row["warning"], created_at=row["created_at"], updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+    )
+
+
 class PluginStore:
     def __init__(self, state_root: str | Path):
         root = Path(state_root).expanduser().resolve()
@@ -207,7 +267,7 @@ class PluginStore:
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()
             version = None if row is None else row["value"]
-            if version not in {"1", str(SCHEMA_VERSION)}:
+            if version not in {"1", "2", str(SCHEMA_VERSION)}:
                 raise IncompatibleState(
                     "INCOMPATIBLE_STATE: database schema "
                     f"{version} is not supported; expected {SCHEMA_VERSION}"
@@ -215,6 +275,9 @@ class PluginStore:
             connection.execute("PRAGMA journal_mode=WAL")
             if version == "1":
                 self._migrate_v1(connection)
+                version = "2"
+            if version == "2":
+                self._migrate_v2(connection)
 
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -275,6 +338,38 @@ class PluginStore:
             ON stage_outputs(run_id, accepted_revision);
             CREATE INDEX idx_runs_listing
             ON runs(status, ticker, created_at DESC, run_id DESC);
+            CREATE TABLE export_receipts (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                decision_id TEXT NOT NULL UNIQUE,
+                report_dir TEXT NOT NULL,
+                complete_report_path TEXT NOT NULL,
+                section_paths_json TEXT NOT NULL,
+                rating TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            );
+            CREATE TABLE reflection_jobs (
+                job_id TEXT PRIMARY KEY,
+                decision_id TEXT NOT NULL UNIQUE,
+                ticker TEXT NOT NULL,
+                decision_date TEXT NOT NULL,
+                rating TEXT NOT NULL,
+                decision_text TEXT NOT NULL,
+                raw_return REAL NOT NULL,
+                alpha_return REAL NOT NULL,
+                holding_sessions INTEGER NOT NULL CHECK (holding_sessions = 5),
+                benchmark TEXT NOT NULL,
+                resolution_date TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('active','ready_to_finalize','completed')),
+                revision INTEGER NOT NULL,
+                current_stage TEXT NOT NULL,
+                reflection TEXT,
+                reflection_hash TEXT,
+                changed INTEGER,
+                warning TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
             """
         )
         connection.execute(
@@ -325,8 +420,29 @@ class PluginStore:
         )
         connection.execute(
             "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
-            (str(SCHEMA_VERSION),),
+            ("2",),
         )
+        connection.commit()
+
+    def _migrate_v2(self, connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("""CREATE TABLE export_receipts (
+            run_id TEXT PRIMARY KEY REFERENCES runs(run_id), decision_id TEXT NOT NULL UNIQUE,
+            report_dir TEXT NOT NULL, complete_report_path TEXT NOT NULL,
+            section_paths_json TEXT NOT NULL, rating TEXT NOT NULL, completed_at TEXT NOT NULL
+        )""")
+        connection.execute("""CREATE TABLE reflection_jobs (
+            job_id TEXT PRIMARY KEY, decision_id TEXT NOT NULL UNIQUE, ticker TEXT NOT NULL,
+            decision_date TEXT NOT NULL, rating TEXT NOT NULL, decision_text TEXT NOT NULL,
+            raw_return REAL NOT NULL, alpha_return REAL NOT NULL,
+            holding_sessions INTEGER NOT NULL CHECK (holding_sessions = 5), benchmark TEXT NOT NULL,
+            resolution_date TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('active','ready_to_finalize','completed')),
+            revision INTEGER NOT NULL, current_stage TEXT NOT NULL, reflection TEXT,
+            reflection_hash TEXT, changed INTEGER, warning TEXT, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, completed_at TEXT
+        )""")
+        connection.execute("UPDATE metadata SET value = '3' WHERE key = 'schema_version'")
 
     def create_run(
         self,
@@ -686,3 +802,142 @@ class PluginStore:
                 (run_id,),
             ).fetchall()
         return [_evidence_record(row) for row in rows]
+
+    def get_export_receipt(self, run_id: str) -> ExportReceipt | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM export_receipts WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return None if row is None else _export_receipt(row)
+
+    def complete_analysis_export(
+        self, *, run_id: str, decision_id: str, report_dir: str,
+        complete_report_path: str, section_paths: list[str], rating: str, now: str,
+    ) -> tuple[ExportReceipt, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM export_receipts WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing is not None:
+                return _export_receipt(existing), False
+            run = connection.execute(
+                "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise RunNotFound(f"RUN_NOT_FOUND: analysis {run_id} does not exist")
+            if run["status"] != "ready_to_finalize":
+                raise RunNotActive(
+                    f"RUN_NOT_ACTIVE: analysis {run_id} has status {run['status']}"
+                )
+            connection.execute(
+                "INSERT INTO export_receipts VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (run_id, decision_id, report_dir, complete_report_path,
+                 canonical_json(section_paths), rating, now),
+            )
+            connection.execute(
+                "UPDATE runs SET status='completed', revision=revision+1, updated_at=? "
+                "WHERE run_id=?", (now, run_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM export_receipts WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return _export_receipt(row), True
+
+    def create_reflection_job(
+        self, *, decision_id: str, ticker: str, decision_date: str, rating: str,
+        decision_text: str, raw_return: float, alpha_return: float,
+        holding_sessions: int, benchmark: str, resolution_date: str, now: str,
+    ) -> tuple[ReflectionJobRecord, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM reflection_jobs WHERE decision_id = ?", (decision_id,)
+            ).fetchone()
+            if existing is not None:
+                return _reflection_job(existing), False
+            job_id = str(uuid4())
+            connection.execute(
+                """INSERT INTO reflection_jobs (
+                    job_id, decision_id, ticker, decision_date, rating, decision_text,
+                    raw_return, alpha_return, holding_sessions, benchmark, resolution_date,
+                    status, revision, current_stage, reflection, reflection_hash, changed,
+                    warning, created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, 'reflection',
+                          NULL, NULL, NULL, NULL, ?, ?, NULL)""",
+                (job_id, decision_id, ticker, decision_date, rating, decision_text,
+                 raw_return, alpha_return, holding_sessions, benchmark, resolution_date, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM reflection_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return _reflection_job(row), True
+
+    def get_reflection_job(self, job_id: str) -> ReflectionJobRecord:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM reflection_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            raise RunNotFound(f"RUN_NOT_FOUND: reflection job {job_id} does not exist")
+        return _reflection_job(row)
+
+    def accept_reflection(
+        self, *, job_id: str, expected_revision: int, reflection: str,
+        reflection_hash: str, now: str,
+    ) -> tuple[ReflectionJobRecord, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM reflection_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise RunNotFound(f"RUN_NOT_FOUND: reflection job {job_id} does not exist")
+            if row["reflection_hash"] is not None:
+                if row["reflection_hash"] != reflection_hash:
+                    raise StageAlreadyAccepted(
+                        "STAGE_ALREADY_ACCEPTED: reflection has a different accepted payload"
+                    )
+                return _reflection_job(row), False
+            if row["status"] != "active" or row["current_stage"] != "reflection":
+                raise RunNotActive(f"RUN_NOT_ACTIVE: reflection job {job_id} is not active")
+            if row["revision"] != expected_revision:
+                raise StaleRevision(
+                    f"STALE_REVISION: expected {expected_revision}, current {row['revision']}"
+                )
+            if reflection_hash != digest_json(reflection):
+                raise StageAlreadyAccepted("STAGE_ALREADY_ACCEPTED: reflection hash does not match")
+            connection.execute(
+                """UPDATE reflection_jobs SET reflection=?, reflection_hash=?,
+                    status='ready_to_finalize', revision=revision+1,
+                    current_stage='finalize', updated_at=? WHERE job_id=?""",
+                (reflection, reflection_hash, now, job_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM reflection_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return _reflection_job(updated), True
+
+    def complete_reflection(
+        self, *, job_id: str, changed: bool, warning: str | None, now: str,
+    ) -> tuple[ReflectionJobRecord, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM reflection_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise RunNotFound(f"RUN_NOT_FOUND: reflection job {job_id} does not exist")
+            if row["status"] == "completed":
+                return _reflection_job(row), False
+            if row["status"] != "ready_to_finalize":
+                raise WrongStage(f"WRONG_STAGE: reflection job {job_id} is not ready to finalize")
+            connection.execute(
+                """UPDATE reflection_jobs SET status='completed', changed=?, warning=?,
+                    revision=revision+1, updated_at=?, completed_at=? WHERE job_id=?""",
+                (int(changed), warning, now, now, job_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM reflection_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return _reflection_job(updated), True
