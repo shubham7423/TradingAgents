@@ -128,7 +128,7 @@ class TradingMemoryLog:
             if as_of is not None and entry["date"] > as_of:
                 continue
             projected = dict(entry)
-            if as_of is not None and entry["resolved"] and entry["resolved"] > as_of:
+            if as_of is not None and (not entry["resolved"] or entry["resolved"] > as_of):
                 projected.update(
                     pending=True, raw=None, alpha=None, holding=None, resolved=None,
                     benchmark=None, reflection="",
@@ -309,7 +309,9 @@ class TradingMemoryLog:
         marker = self._ID_RE.search(body)
         decision_match = self._DECISION_RE.search(body)
         reflection_match = self._REFLECTION_RE.search(body)
-        decision = decision_match.group(1).strip() if decision_match else ""
+        if decision_match is None:
+            return None
+        decision = decision_match.group(1).strip()
         identity = marker.group(1).strip() if marker else self._decision_id(fields[0], fields[1], fields[2], decision)
         return {
             "date": fields[0], "ticker": fields[1], "rating": fields[2],

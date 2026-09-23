@@ -131,6 +131,16 @@ def test_history_skips_malformed_block_with_warning(tmp_path):
     assert any("malformed memory entry" in warning for warning in warnings)
 
 
+def test_history_warns_when_tagged_block_has_no_decision_section(tmp_path):
+    path = tmp_path / "trading_memory.md"
+    path.write_text(f"[2026-01-05 | AAPL | Buy | pending]\n\n{TradingMemoryLog._SEPARATOR}")
+
+    entries, warnings = TradingMemoryLog({"memory_log_path": str(path)}).get_history()
+
+    assert entries == []
+    assert any("malformed memory entry" in warning for warning in warnings)
+
+
 def test_concurrent_append_and_update_preserve_both_entries(tmp_path):
     path = tmp_path / "trading_memory.md"
     TradingMemoryLog({"memory_log_path": str(path)}).store_decision(

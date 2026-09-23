@@ -83,6 +83,20 @@ def test_legacy_entry_without_resolution_date_excluded_in_backtest(tmp_path):
 
 
 @pytest.mark.unit
+def test_history_projects_legacy_outcome_without_known_by_date_as_pending(tmp_path):
+    log = _log(tmp_path)
+    log.store_decision("NVDA", "2026-01-05", "Rating: Buy\nlegacy lesson")
+    log.update_with_outcome("NVDA", "2026-01-05", 0.05, 0.02, 5, "legacy lesson")
+
+    entries, warnings = log.get_history(ticker="NVDA", as_of="2026-06-01")
+
+    assert warnings == []
+    assert entries[0]["pending"] is True
+    assert entries[0]["raw"] is None
+    assert entries[0]["reflection"] == ""
+
+
+@pytest.mark.unit
 def test_cross_ticker_lessons_are_also_gated(tmp_path):
     log = _log(tmp_path)
     _resolve(log, "AAPL", "2026-01-05", "2026-01-10", "cross lesson")
