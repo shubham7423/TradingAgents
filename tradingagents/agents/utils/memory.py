@@ -90,6 +90,11 @@ class TradingMemoryLog:
             entries = [self._parse_entry(raw) for raw in text.split(self._SEPARATOR) if raw.strip()]
             if any(entry and entry["decision_id"] == identity for entry in entries):
                 return text, False, False
+            if decision_id is None and any(
+                entry and entry["ticker"] == ticker and entry["date"] == trade_date
+                for entry in entries
+            ):
+                return text, False, False
             tag = f"[{trade_date} | {ticker} | {rating} | pending]"
             block = f"{tag}\n\n<!-- decision_id: {identity} -->\nDECISION:\n{final_trade_decision}"
             return text + block + self._SEPARATOR, True, True

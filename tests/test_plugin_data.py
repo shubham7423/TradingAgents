@@ -385,6 +385,29 @@ def test_skip_reflections_is_fingerprinted_and_persisted(tools, store, monkeypat
         tools.start_analysis(request_id=request_id, ticker="AAPL", skip_reflections=False)
 
 
+def test_start_analysis_replays_pre_v3_fingerprint(tools, store, monkeypatch):
+    _stub_identity_and_date(monkeypatch)
+    request_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    legacy = {
+        "ticker": "AAPL", "analysis_date": None, "asset_type": "stock",
+        "analysts": list(data.ANALYST_NODE_SPECS), "research_rounds": 1,
+        "risk_rounds": 1, "output_language": "English",
+        "vendor_overrides": {"categories": {}, "tools": {}},
+    }
+    record, _ = store.create_run(
+        request_id=request_id,
+        request_hash=digest_json(legacy),
+        normalized_inputs={**legacy, "analysis_date": "2026-09-15"},
+        current_stage="analyst/market", frozen_config={}, instrument={}, lessons="",
+        now="2026-09-15T12:00:00+00:00",
+    )
+
+    replay = tools.start_analysis(request_id=request_id, ticker="AAPL")
+
+    assert replay.run_id == record.run_id
+    assert replay.learning_omitted is False
+
+
 def test_history_filters_ticker_pages_and_hides_future_outcome(tmp_path):
     config = {"memory_log_path": str(tmp_path / "memory.md")}
     memory = TradingMemoryLog(config)

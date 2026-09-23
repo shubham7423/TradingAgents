@@ -56,7 +56,8 @@ def calculate_outcome(
         if len(stock) <= holding_sessions or len(bench) <= holding_sessions:
             return None
         resolution_date = stock.index[holding_sessions].strftime("%Y-%m-%d")
-        if as_of_date is not None and resolution_date > as_of_date:
+        benchmark_resolution_date = bench.index[holding_sessions].strftime("%Y-%m-%d")
+        if as_of_date is not None and max(resolution_date, benchmark_resolution_date) > as_of_date:
             return None
         stock_start, stock_end = (
             float(stock["Close"].iloc[index]) for index in (0, holding_sessions)

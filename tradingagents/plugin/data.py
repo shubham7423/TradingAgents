@@ -1280,6 +1280,9 @@ class PluginTools:
             "vendor_overrides": overrides,
             "learning_omitted": request.skip_reflections,
         }
+        legacy_fingerprint = {
+            key: value for key, value in fingerprint.items() if key != "learning_omitted"
+        }
         normalized_inputs = {**fingerprint, "analysis_date": resolved_date}
 
         metadata = resolve_instrument_identity(canonical)
@@ -1316,6 +1319,9 @@ class PluginTools:
             instrument=instrument,
             lessons=lessons,
             now=datetime.now(timezone.utc).isoformat(),
+            legacy_request_hash=(
+                digest_json(legacy_fingerprint) if not request.skip_reflections else None
+            ),
         )
         return self._analysis_result(record)
 

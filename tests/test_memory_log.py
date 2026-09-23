@@ -187,6 +187,29 @@ def test_calculate_outcome_uses_fifth_session_and_cutoff(monkeypatch):
     ) is None
 
 
+def test_calculate_outcome_cutoff_includes_benchmark_calendar(monkeypatch):
+    frames = {
+        "AAPL": _price_df([100, 101, 102, 103, 104, 110], "2026-01-05"),
+        "SPY": _price_df([400, 401, 402, 403, 404, 420], "2026-01-06"),
+    }
+    monkeypatch.setattr(
+        "tradingagents.graph.reflection.yf.Ticker",
+        lambda symbol: SimpleNamespace(history=lambda **_: frames[symbol]),
+    )
+
+    assert calculate_outcome(
+        "AAPL", "2026-01-05", {"benchmark_map": {"": "SPY"}},
+        as_of_date="2026-01-10",
+    ) is None
+
+
+def test_legacy_store_decision_keeps_same_date_guard(tmp_path):
+    log = make_log(tmp_path)
+    assert log.store_decision("AAPL", "2026-01-05", DECISION_BUY)
+    assert not log.store_decision("AAPL", "2026-01-05", DECISION_SELL)
+    assert len(log.load_entries()) == 1
+
+
 def test_resolve_benchmark_prefers_explicit_then_suffix():
     assert resolve_benchmark(
         {"benchmark_ticker": "QQQ", "benchmark_map": {".T": "^N225", "": "SPY"}},

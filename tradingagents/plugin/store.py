@@ -455,6 +455,7 @@ class PluginStore:
         instrument: dict,
         lessons: str,
         now: str,
+        legacy_request_hash: str | None = None,
     ) -> tuple[RunRecord, bool]:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -462,7 +463,12 @@ class PluginStore:
                 "SELECT * FROM runs WHERE request_id = ?", (request_id,)
             ).fetchone()
             if row is not None:
-                if row["request_hash"] != request_hash:
+                legacy_match = (
+                    legacy_request_hash is not None
+                    and row["request_hash"] == legacy_request_hash
+                    and "learning_omitted" not in json.loads(row["normalized_inputs_json"])
+                )
+                if row["request_hash"] != request_hash and not legacy_match:
                     raise RequestIdConflict(
                         f"REQUEST_ID_CONFLICT: request {request_id} has a different payload"
                     )
