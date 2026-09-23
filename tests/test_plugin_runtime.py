@@ -19,6 +19,9 @@ EXPECTED_TOOLS = {
     "submit_stage",
     "list_analyses",
     "cancel_analysis",
+    "finalize_analysis",
+    "prepare_reflections",
+    "get_decision_history",
     "get_stock_data",
     "get_indicators",
     "get_verified_market_snapshot",
@@ -44,6 +47,10 @@ def test_sdk_executes_and_cancels_workflow(tmp_path, monkeypatch):
     from tradingagents.plugin import data
     from tradingagents.plugin.server import create_server
 
+    def structured(result):
+        value = result.structuredContent
+        return value.get("result", value)
+
     monkeypatch.setattr(data, "resolve_instrument_identity", lambda ticker: {})
     monkeypatch.setattr(data.TradingMemoryLog, "get_past_context", lambda *args, **kwargs: "")
     server = create_server(tmp_path)
@@ -56,7 +63,7 @@ def test_sdk_executes_and_cancels_workflow(tmp_path, monkeypatch):
                 "analysis_date": "2026-09-15",
                 "analysts": ["news"],
             })
-            run_id = started.structuredContent["run_id"]
+            run_id = structured(started)["run_id"]
             read = await client.call_tool("get_analysis", {"run_id": run_id})
             analyst = await client.call_tool("submit_stage", {
                 "run_id": run_id,
@@ -73,12 +80,12 @@ def test_sdk_executes_and_cancels_workflow(tmp_path, monkeypatch):
             listed = await client.call_tool("list_analyses", {"status": "active"})
             cancelled = await client.call_tool("cancel_analysis", {
                 "run_id": run_id,
-                "expected_revision": analyst.structuredContent["revision"],
+                "expected_revision": structured(analyst)["revision"],
             })
             after_cancel = await client.call_tool("submit_stage", {
                 "run_id": run_id,
                 "stage_id": "research/bull/1",
-                "expected_revision": cancelled.structuredContent["revision"],
+                "expected_revision": structured(cancelled)["revision"],
                 "output": "Bull case.",
             })
             return started, read, analyst, stale, listed, cancelled, after_cancel
@@ -86,13 +93,13 @@ def test_sdk_executes_and_cancels_workflow(tmp_path, monkeypatch):
     started, read, analyst, stale, listed, cancelled, after_cancel = asyncio.run(invoke())
 
     assert not started.isError
-    assert read.structuredContent["active_role"] == "news"
-    assert read.structuredContent["instructions"]
-    assert analyst.structuredContent["current_stage"] == "research/bull/1"
+    assert structured(read)["active_role"] == "news"
+    assert structured(read)["instructions"]
+    assert structured(analyst)["current_stage"] == "research/bull/1"
     assert stale.isError
     assert "STALE_REVISION" in stale.content[0].text
-    assert listed.structuredContent["analyses"][0]["run_id"] == started.structuredContent["run_id"]
-    assert cancelled.structuredContent["status"] == "cancelled"
+    assert structured(listed)["analyses"][0]["run_id"] == structured(started)["run_id"]
+    assert structured(cancelled)["status"] == "cancelled"
     assert after_cancel.isError
     assert "RUN_CANCELLED" in after_cancel.content[0].text
 

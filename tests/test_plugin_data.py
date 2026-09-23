@@ -375,6 +375,49 @@ def test_start_analysis_defaults_and_freezes_first_stage(tools, monkeypatch):
     assert "llm_provider" not in result.frozen_config
 
 
+def test_skip_reflections_is_fingerprinted_and_persisted(tools, store, monkeypatch):
+    _stub_identity_and_date(monkeypatch)
+    request_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    result = tools.start_analysis(request_id=request_id, ticker="AAPL", skip_reflections=True)
+    assert result.learning_omitted is True
+    assert store.get_run(result.run_id).normalized_inputs["learning_omitted"] is True
+    with pytest.raises(RequestIdConflict):
+        tools.start_analysis(request_id=request_id, ticker="AAPL", skip_reflections=False)
+
+
+def test_history_filters_ticker_pages_and_hides_future_outcome(tmp_path):
+    config = {"memory_log_path": str(tmp_path / "memory.md")}
+    memory = TradingMemoryLog(config)
+    plugin_tools = data.PluginTools(PluginStore(tmp_path / "state"), server_config=config)
+    memory.store_decision("AAPL", "2026-01-05", "First", decision_id="aapl-1")
+    memory.resolve_decision(
+        decision_id="aapl-1", ticker="AAPL", trade_date="2026-01-05",
+        raw_return=0.10, alpha_return=0.05, holding_days=5, benchmark_name="SPY",
+        resolution_date="2026-01-10", reflection="Future lesson.",
+    )
+    memory.store_decision("AAPL", "2026-01-06", "Second", decision_id="aapl-2")
+    memory.store_decision("MSFT", "2026-01-06", "Other", decision_id="msft-1")
+    first = plugin_tools.get_decision_history(ticker="AAPL", as_of_date="2026-01-09", limit=1)
+    assert len(first.entries) == 1
+    assert first.entries[0].ticker == "AAPL"
+    assert first.entries[0].pending is True
+    assert first.entries[0].raw_return is None
+    assert first.entries[0].alpha_return is None
+    assert first.entries[0].resolution_date is None
+    assert first.entries[0].reflection is None
+    second = plugin_tools.get_decision_history(
+        ticker="AAPL", as_of_date="2026-01-09", limit=1, cursor=first.next_cursor
+    )
+    assert {first.entries[0].decision_id, second.entries[0].decision_id} == {
+        "aapl-1", "aapl-2"
+    }
+
+
+def test_history_rejects_path_like_unknown_arguments(tools):
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        tools.get_decision_history(path="/tmp/secret")
+
+
 def test_start_analysis_is_idempotent_for_normalized_inputs(tools, store, monkeypatch):
     _stub_identity_and_date(monkeypatch)
 

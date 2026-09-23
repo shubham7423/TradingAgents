@@ -14,6 +14,9 @@ EXPECTED_TOOLS = {
     "submit_stage",
     "list_analyses",
     "cancel_analysis",
+    "finalize_analysis",
+    "prepare_reflections",
+    "get_decision_history",
     "get_stock_data",
     "get_indicators",
     "get_verified_market_snapshot",
@@ -50,7 +53,7 @@ def test_credentials_are_presence_only(monkeypatch):
     assert result.data_sources["alpha_vantage"].credential_present is False
     assert "secret-sentinel-123" not in result.model_dump_json()
     assert set(result.available_tools) == EXPECTED_TOOLS
-    assert result.planned_data_tools == ["get_decision_history"]
+    assert result.planned_data_tools == []
     assert result.api_runner_settings == [
         "llm_provider",
         "deep_think_llm",
@@ -76,7 +79,7 @@ def test_credentials_are_presence_only(monkeypatch):
         and result.data_sources[name].credential_present is None
         for name in ("yfinance", "polymarket", "stocktwits", "reddit")
     )
-    assert result.schema_version == 2
+    assert result.schema_version == 3
     assert result.analysis_settings.available is True
     assert result.analysis_settings.model_dump() == {
         "available": True,
@@ -99,7 +102,7 @@ def test_credentials_are_presence_only(monkeypatch):
     ]
     assert result.roles[1].label == "Sentiment Analyst"
     assert all(role.workflow_available for role in result.roles if role.key != "reflection")
-    assert not next(role for role in result.roles if role.key == "reflection").workflow_available
+    assert next(role for role in result.roles if role.key == "reflection").workflow_available
 
 
 def test_empty_and_unrelated_credentials_are_not_discovered(monkeypatch):
@@ -160,6 +163,8 @@ def test_create_server_registers_public_tools(tmp_path):
 
     assert {tool.name for tool in registered} == EXPECTED_TOOLS
     assert all(tool.inputSchema["additionalProperties"] is False for tool in registered)
+    for tool in registered:
+        assert not {"path", "destination"} & tool.inputSchema["properties"].keys()
     submit = next(tool for tool in registered if tool.name == "submit_stage")
     assert submit.inputSchema["properties"]["output"]["anyOf"] == [
         {"type": "string"},
@@ -174,6 +179,7 @@ from tradingagents.plugin.server import get_capabilities
 expected_tools = {
     "get_capabilities", "start_analysis", "get_analysis",
     "submit_stage", "list_analyses", "cancel_analysis",
+    "finalize_analysis", "prepare_reflections", "get_decision_history",
     "get_stock_data", "get_indicators", "get_verified_market_snapshot",
     "get_fundamentals", "get_balance_sheet", "get_cashflow", "get_income_statement",
     "get_news", "get_global_news", "get_insider_transactions",

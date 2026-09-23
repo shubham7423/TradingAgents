@@ -132,6 +132,26 @@ def _decode_analysis_cursor(cursor: str) -> tuple[str, str]:
     return created_at, run_id
 
 
+def _encode_history_cursor(decision_id: str, occurrence: int) -> str:
+    payload = canonical_json({"decision_id": decision_id, "occurrence": occurrence}).encode()
+    return base64.urlsafe_b64encode(payload).decode()
+
+
+def _decode_history_cursor(cursor: str) -> tuple[str, int]:
+    try:
+        raw = base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True)
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) != {"decision_id", "occurrence"}:
+            raise ValueError
+        decision_id, occurrence = payload["decision_id"], payload["occurrence"]
+        if (not isinstance(decision_id, str) or type(occurrence) is not int or occurrence < 0
+                or cursor != _encode_history_cursor(decision_id, occurrence)):
+            raise ValueError
+    except (UnicodeEncodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid history cursor") from exc
+    return decision_id, occurrence
+
+
 def _page_size(value: int | None) -> int:
     if value is None:
         return MAX_PAGE_SIZE
@@ -380,6 +400,7 @@ class StartAnalysisRequest(BaseModel):
     research_rounds: int = Field(default=1, ge=1, le=MAX_ROUNDS)
     risk_rounds: int = Field(default=1, ge=1, le=MAX_ROUNDS)
     output_language: str = Field(default="English", min_length=1, max_length=100)
+    skip_reflections: bool = False
     vendor_overrides: VendorOverrides = Field(default_factory=VendorOverrides)
 
     @model_validator(mode="after")
@@ -448,6 +469,7 @@ class AnalysisResult(BaseModel):
     research_rounds: int
     risk_rounds: int
     output_language: str
+    learning_omitted: bool = False
     frozen_config: dict
     instrument: dict
     lessons: str
@@ -569,6 +591,31 @@ class CancellationResult(BaseModel):
     changed: bool
 
 
+class DecisionHistoryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str
+    decision_date: str
+    ticker: str
+    rating: str
+    pending: bool
+    decision: str
+    raw_return: float | None = None
+    alpha_return: float | None = None
+    holding_sessions: int | None = None
+    benchmark: str | None = None
+    resolution_date: str | None = None
+    reflection: str | None = None
+
+
+class DecisionHistoryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[DecisionHistoryEntry]
+    warnings: list[str]
+    next_cursor: str | None = None
+
+
 class AnalysisFinalizationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -611,6 +658,7 @@ class PluginTools:
             self.cancel_analysis,
             self.finalize_analysis,
             self.prepare_reflections,
+            self.get_decision_history,
             self.get_stock_data,
             self.get_indicators,
             self.get_verified_market_snapshot,
@@ -1201,6 +1249,7 @@ class PluginTools:
         risk_rounds: int = 1,
         output_language: str = "English",
         vendor_overrides: VendorOverrides | None = None,
+        skip_reflections: bool = False,
     ) -> AnalysisResult:
         request = StartAnalysisRequest(
             request_id=request_id,
@@ -1211,6 +1260,7 @@ class PluginTools:
             research_rounds=research_rounds,
             risk_rounds=risk_rounds,
             output_language=output_language,
+            skip_reflections=skip_reflections,
             vendor_overrides=(
                 VendorOverrides() if vendor_overrides is None else vendor_overrides
             ),
@@ -1227,6 +1277,7 @@ class PluginTools:
             "risk_rounds": request.risk_rounds,
             "output_language": request.output_language,
             "vendor_overrides": overrides,
+            "learning_omitted": request.skip_reflections,
         }
         normalized_inputs = {**fingerprint, "analysis_date": resolved_date}
 
@@ -1239,9 +1290,9 @@ class PluginTools:
             "context": build_instrument_context(canonical, request.asset_type, metadata),
             "source": "yfinance" if metadata else "symbol_utils",
         }
-        lessons = TradingMemoryLog(self._server_config).get_past_context(
-            canonical, as_of=resolved_date
-        )
+        lessons = "" if request.skip_reflections else TradingMemoryLog(
+            self._server_config
+        ).get_past_context(canonical, as_of=resolved_date)
         frozen_config = {
             key: deepcopy(self._server_config[key])
             for key in DATA_CONFIG_KEYS
@@ -1364,6 +1415,57 @@ class PluginTools:
             warnings=prepared.warnings,
         )
 
+    def get_decision_history(
+        self,
+        ticker: str | None = None,
+        as_of_date: str | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> DecisionHistoryResult:
+        limit = _validate_limit(limit, "limit")
+        ticker = None if ticker is None else _validate_ticker(ticker)
+        as_of = None if as_of_date is None else _validate_date(as_of_date, "as_of_date")
+        before = None if cursor is None else _decode_history_cursor(cursor)
+        history, warnings = TradingMemoryLog(self._server_config).get_history(
+            ticker=ticker, as_of=as_of
+        )
+        history.reverse()
+        occurrences: dict[str, int] = {}
+        indexed = []
+        for entry in history:
+            identity = entry["decision_id"]
+            occurrence = occurrences.get(identity, 0)
+            occurrences[identity] = occurrence + 1
+            indexed.append((entry, identity, occurrence))
+        start = 0
+        if before is not None:
+            try:
+                start = next(
+                    index + 1 for index, (_, identity, occurrence) in enumerate(indexed)
+                    if (identity, occurrence) == before
+                )
+            except StopIteration as exc:
+                raise ValueError("cursor does not match decision history") from exc
+        page = indexed[start:start + limit]
+        entries = []
+        for entry, _, _ in page:
+            entries.append(DecisionHistoryEntry(
+                decision_id=entry["decision_id"], decision_date=entry["date"],
+                ticker=entry["ticker"], rating=entry["rating"], pending=entry["pending"],
+                decision=entry["decision"],
+                raw_return=None if entry["pending"] or not entry["raw"] else float(entry["raw"].rstrip("%")) / 100,
+                alpha_return=None if entry["pending"] or not entry["alpha"] else float(entry["alpha"].rstrip("%")) / 100,
+                holding_sessions=None if entry["pending"] or not entry["holding"] else int(entry["holding"].rstrip("d")),
+                benchmark=entry["benchmark"] or None,
+                resolution_date=entry["resolved"] or None,
+                reflection=entry["reflection"] or None,
+            ))
+        next_cursor = None
+        if start + len(page) < len(indexed) and page:
+            _, identity, occurrence = page[-1]
+            next_cursor = _encode_history_cursor(identity, occurrence)
+        return DecisionHistoryResult(entries=entries, warnings=warnings, next_cursor=next_cursor)
+
     @staticmethod
     def _reflection_result(job) -> ReflectionResult:
         active = job.status == "active"
@@ -1421,6 +1523,7 @@ class PluginTools:
             research_rounds=inputs["research_rounds"],
             risk_rounds=inputs["risk_rounds"],
             output_language=inputs["output_language"],
+            learning_omitted=inputs.get("learning_omitted", False),
             frozen_config=record.frozen_config,
             instrument=record.instrument,
             lessons=record.lessons,

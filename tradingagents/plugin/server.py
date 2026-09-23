@@ -49,7 +49,7 @@ class Capabilities(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runtime_version: str
-    schema_version: int = 2
+    schema_version: int = 3
     mcp_sdk_version: str | None
     available_tools: list[str]
     planned_data_tools: list[str]
@@ -76,7 +76,7 @@ def get_capabilities() -> Capabilities:
         for spec in ANALYST_NODE_SPECS.values()
     ]
     roles.extend(
-        RoleCapability(key=key, label=label, workflow_available=key != "reflection")
+        RoleCapability(key=key, label=label, workflow_available=True)
         for key, label in (
             ("bull", "Bull Analyst"),
             ("bear", "Bear Analyst"),
@@ -112,6 +112,9 @@ def get_capabilities() -> Capabilities:
             "submit_stage",
             "list_analyses",
             "cancel_analysis",
+            "finalize_analysis",
+            "prepare_reflections",
+            "get_decision_history",
             "get_stock_data",
             "get_indicators",
             "get_verified_market_snapshot",
@@ -128,7 +131,7 @@ def get_capabilities() -> Capabilities:
             "fetch_stocktwits_messages",
             "fetch_reddit_posts",
         ],
-        planned_data_tools=["get_decision_history"],
+        planned_data_tools=[],
         roles=roles,
         analysis_settings=AnalysisSettings(
             available=True,
