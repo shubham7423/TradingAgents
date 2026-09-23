@@ -238,8 +238,11 @@ class WorkflowService:
                 job_id=run_id, expected_revision=expected_revision, reflection=output,
                 reflection_hash=digest_json(output), now=datetime.now(timezone.utc).isoformat(),
             )
-            return AcceptedReflection(accepted.job_id, accepted.status, accepted.revision,
-                                     "finalize", accepted.reflection)
+            # Completion advances the durable revision, but a same-payload replay is the
+            # original accepted submission and must return its receipt without reopening it.
+            accepted_revision = accepted.revision - 1 if accepted.status == "completed" else accepted.revision
+            return AcceptedReflection(accepted.job_id, "ready_to_finalize", accepted_revision,
+                                      "finalize", accepted.reflection)
         snapshot = self._store.get_snapshot(run_id)
         _require_compatible_run(snapshot.run)
         prepared = prepare_output(stage_id, output)

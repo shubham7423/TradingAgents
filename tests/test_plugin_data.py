@@ -160,6 +160,14 @@ def test_public_reflection_lifecycle_never_constructs_an_llm(tmp_path, monkeypat
     assert done.work_type == "reflection"
     assert done.status == "completed"
     assert memory.load_entries()[0]["reflection"] == "The call beat SPY. Keep the lesson."
+    completed = tools.get_analysis(job_id)
+    replayed = tools.submit_stage(job_id, "reflection", 1,
+                                  "The call beat SPY. Keep the lesson.")
+    assert replayed.status == "ready_to_finalize"
+    assert replayed.revision == accepted.revision
+    assert replayed.current_stage == "finalize"
+    assert replayed.reflection == accepted.reflection
+    assert tools.get_analysis(job_id).revision == completed.revision
 
 
 @pytest.mark.parametrize("field", ["state_schema", "prompt_schema"])
