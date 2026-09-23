@@ -355,6 +355,8 @@ def test_reflection_transitions_are_atomic_and_idempotent(tmp_path):
     assert repeated == accepted
     with pytest.raises(StageAlreadyAccepted):
         store.accept_reflection(**(values | {"reflection": "different", "reflection_hash": digest_json("different")}))
+    with pytest.raises(StageAlreadyAccepted, match="reflection hash does not match"):
+        store.accept_reflection(**(values | {"reflection": "tampered", "reflection_hash": values["reflection_hash"]}))
     stale_job, _ = store.create_reflection_job(**reflection_job_values("decision-2"))
     with pytest.raises(StaleRevision):
         store.accept_reflection(**(values | {"expected_revision": 2, "job_id": stale_job.job_id}))

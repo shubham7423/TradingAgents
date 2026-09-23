@@ -893,6 +893,8 @@ class PluginStore:
             ).fetchone()
             if row is None:
                 raise RunNotFound(f"RUN_NOT_FOUND: reflection job {job_id} does not exist")
+            if reflection_hash != digest_json(reflection):
+                raise StageAlreadyAccepted("STAGE_ALREADY_ACCEPTED: reflection hash does not match")
             if row["reflection_hash"] is not None:
                 if row["reflection_hash"] != reflection_hash:
                     raise StageAlreadyAccepted(
@@ -905,8 +907,6 @@ class PluginStore:
                 raise StaleRevision(
                     f"STALE_REVISION: expected {expected_revision}, current {row['revision']}"
                 )
-            if reflection_hash != digest_json(reflection):
-                raise StageAlreadyAccepted("STAGE_ALREADY_ACCEPTED: reflection hash does not match")
             connection.execute(
                 """UPDATE reflection_jobs SET reflection=?, reflection_hash=?,
                     status='ready_to_finalize', revision=revision+1,
