@@ -71,8 +71,12 @@ evidence and outputs, is idempotent once recorded, and permanently rejects later
 submissions for that run. Start a new run to resume work after cancellation.
 
 After the portfolio stage, the run becomes `ready_to_finalize` at the `finalize` sentinel.
-`finalize` is not a submittable stage. Report export, decision memory, and completion arrive in
-US-014; this milestone stops at the durable ready-to-finalize state.
+`finalize` is not a submittable stage. Call `finalize_analysis` to write the existing per-section
+Markdown reports and consolidated report under `<results_dir>/plugin/<run_id>/`, append the
+decision to memory using the run UUID as its stable identity, then record the export receipt and
+mark the run complete. A retry first checks for that receipt. If a previous attempt wrote memory
+but failed before recording completion, the stable decision identity prevents a duplicate memory
+entry and the export can be retried.
 
 Data tools return `status`, `content`, `content_format`, `source`, `warnings`, `fetched_at`,
 `reused`, `retryable`, evidence/run/stage IDs, and a `page` object. Standalone calls are not saved.
@@ -83,3 +87,30 @@ saved, so a repeated request fetches again. Saved content can be continued with 
 
 Host manifest installation and packaged activation remain explicitly out of scope until US-018;
 use direct executable launch or `codex mcp add` in the meantime.
+
+## Decision history and reflections
+
+`get_decision_history` is read-only and supports ticker and `as_of_date` filters with cursor
+pagination. The Markdown memory log gives plugin-created decisions their run UUID as a canonical
+identity; older entries without an identity are resolved from their date, ticker, rating, and
+decision text, and ambiguous duplicate legacy identities are reported rather than guessed. Memory
+mutations use a sibling lock file across processes and an atomic replacement, preserving concurrent
+plugin and existing-runner writes.
+
+An as-of history view omits decisions after the cutoff and projects a decision as pending when its
+outcome was resolved after the cutoff. New analysis receives only lessons whose resolution date is
+on or before its analysis date. This prevents later outcomes and reflections from leaking into
+historical views or prompts.
+
+`prepare_reflections(ticker, as_of_date)` creates or reuses jobs for eligible pending decisions.
+An outcome is available only after the full five-session holding period; the job records raw return,
+benchmark-relative return, the five-session period, benchmark identity, and resolution date. If the
+window is incomplete or unavailable, the decision remains pending. Read a job with `get_analysis`,
+submit Codex's nonempty reflection for its `reflection` stage using the current revision, then call
+`finalize_analysis`. The runtime builds the existing concise reflection prompt but never invokes an
+LLM; finalization updates the identified decision once and is retryable.
+
+`start_analysis` accepts `skip_reflections`. When true, it omits prior lessons and returns
+`learning_omitted=true` in the run result. Automatic preparation and completion of reflections
+before a new analysis is intentionally deferred to US-017's skill orchestration; the runtime does
+not launch that workflow itself.

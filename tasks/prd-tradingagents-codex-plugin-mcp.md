@@ -205,35 +205,35 @@ Each story includes focused automated checks and repository lint. There is no ne
 **Description:** As a user, I want saved reports and history entries that remain correct when finalization is retried.
 
 **Acceptance Criteria:**
-- [ ] `finalize_analysis` writes the existing per-section report tree and consolidated report into a run-owned directory and returns paths and rating.
-- [ ] It exports one decision using a stable identity and marks the run completed only after exports succeed.
-- [ ] A failure after memory write but before completion can be retried without duplicate decisions.
-- [ ] Concurrent writes preserve both plugin and existing-runner history; legacy memory entries remain readable.
-- [ ] A read-only history tool supports ticker and as-of filtering without exposing arbitrary local files.
-- [ ] Export fault-injection, concurrent-memory, legacy-memory, and reporting tests pass; `ruff check .` passes.
+- [x] `finalize_analysis` writes the existing per-section report tree and consolidated report into a run-owned directory and returns paths and rating.
+- [x] It exports one decision using a stable identity and marks the run completed only after exports succeed.
+- [x] A failure after memory write but before completion can be retried without duplicate decisions.
+- [x] Concurrent writes preserve both plugin and existing-runner history; legacy memory entries remain readable.
+- [x] A read-only history tool supports ticker and as-of filtering without exposing arbitrary local files.
+- [x] Export fault-injection, concurrent-memory, legacy-memory, and reporting tests pass; `ruff check .` passes. (Focused suites and Ruff passed; full-suite result is recorded in `docs/user-testing-us-014-016.md`.)
 
 ### US-015: Prepare historical outcomes for reflection
 
 **Description:** As a user, I want measured outcomes attached to past decisions so reflections use real results.
 
 **Acceptance Criteria:**
-- [ ] `prepare_reflections` finds same-ticker pending decisions and reuses shared return/benchmark calculation code.
-- [ ] A job is prepared only when the full required holding window is available and its resolution date is no later than the requested as-of date.
-- [ ] Raw return, benchmark-relative return, holding period, benchmark identity, and resolution date are stored with the job.
-- [ ] Too-recent or unavailable outcomes leave the decision pending; repeated preparation reuses the existing decision/outcome job.
-- [ ] Outcome-window, benchmark, historical-cutoff, and duplicate-preparation tests pass; `ruff check .` passes.
+- [x] `prepare_reflections` finds same-ticker pending decisions and reuses shared return/benchmark calculation code.
+- [x] A job is prepared only when the full required holding window is available and its resolution date is no later than the requested as-of date.
+- [x] Raw return, benchmark-relative return, holding period, benchmark identity, and resolution date are stored with the job.
+- [x] Too-recent or unavailable outcomes leave the decision pending; repeated preparation reuses the existing decision/outcome job.
+- [x] Outcome-window, benchmark, historical-cutoff, and duplicate-preparation tests pass; `ruff check .` passes. (Focused suites and Ruff passed; full-suite result is recorded in `docs/user-testing-us-014-016.md`.)
 
 ### US-016: Save and reuse Codex-authored reflections
 
 **Description:** As a user, I want Codex to review past decisions and carry eligible lessons into later analysis.
 
 **Acceptance Criteria:**
-- [ ] Reflection jobs use the same read/submit/finalize lifecycle and the existing concise reflection prompt.
-- [ ] Codex supplies the reflection; the Python runtime never invokes `Reflector` with an API model.
-- [ ] Finalization updates the intended decision with outcome fields and reflection exactly once, including for supported legacy entries.
-- [ ] The skill completes eligible same-ticker reflection jobs before starting a new analysis, unless the user explicitly requests analysis without that learning step; such a run records the omission.
-- [ ] New historical runs include only lessons resolved by their analysis date.
-- [ ] Reflection lifecycle/retry/historical-memory tests and `ruff check .` pass.
+- [x] Reflection jobs use the same read/submit/finalize lifecycle and the existing concise reflection prompt.
+- [x] Codex supplies the reflection; the Python runtime never invokes `Reflector` with an API model.
+- [x] Finalization updates the intended decision with outcome fields and reflection exactly once, including for supported legacy entries.
+- [ ] The skill completes eligible same-ticker reflection jobs before starting a new analysis, unless the user explicitly requests analysis without that learning step; such a run records the omission. **Deferred to US-017: automatic skill orchestration is intentionally outside this runtime milestone.**
+- [x] New historical runs include only lessons resolved by their analysis date.
+- [x] Reflection lifecycle/retry/historical-memory tests and `ruff check .` pass. (Focused suites and Ruff passed; full-suite result is recorded in `docs/user-testing-us-014-016.md`.)
 
 ### US-017: Guide the entire workflow through a skill
 
