@@ -1,6 +1,7 @@
 """Report parity: the shared writer produces the report tree for the CLI and the
 programmatic API alike (#1037)."""
 
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +32,13 @@ def test_write_report_tree_creates_files(tmp_path):
     complete = out.read_text()
     assert "Trading Analysis Report: AAPL" in complete
     assert "MKT" in complete and "PM DECISION" in complete
+
+
+@pytest.mark.unit
+def test_write_report_tree_accepts_stable_generated_at(tmp_path):
+    generated = datetime(2026, 9, 21, 12, 30, 0)
+    out = write_report_tree(_state(), "AAPL", tmp_path, generated_at=generated)
+    assert "Generated: 2026-09-21 12:30:00" in out.read_text()
 
 
 @pytest.mark.unit

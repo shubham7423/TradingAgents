@@ -1,5 +1,6 @@
 """Tests for TradingMemoryLog — storage, deferred reflection, PM injection, legacy removal."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -9,7 +10,7 @@ from tradingagents.agents.managers.portfolio_manager import create_portfolio_man
 from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.graph.propagation import Propagator
-from tradingagents.graph.reflection import Reflector
+from tradingagents.graph.reflection import Reflector, calculate_outcome, resolve_benchmark
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 _SEP = TradingMemoryLog._SEPARATOR
@@ -62,6 +63,45 @@ def _price_df(prices, start="2026-01-05"):
     """
     idx = pd.date_range(start=start, periods=len(prices), freq="D")
     return pd.DataFrame({"Close": prices}, index=idx)
+
+
+def test_calculate_outcome_uses_fifth_session_and_cutoff(monkeypatch):
+    frames = {
+        "AAPL": _price_df([100, 101, 102, 103, 104, 110], "2026-01-05"),
+        "SPY": _price_df([400, 401, 402, 403, 404, 420], "2026-01-05"),
+    }
+    monkeypatch.setattr(
+        "tradingagents.graph.reflection.yf.Ticker",
+        lambda symbol: SimpleNamespace(history=lambda **_: frames[symbol]),
+    )
+    config = {"benchmark_ticker": None, "benchmark_map": {"": "SPY"}}
+
+    outcome = calculate_outcome("AAPL", "2026-01-05", config)
+
+    assert outcome.holding_sessions == 5
+    assert outcome.resolution_date == "2026-01-10"
+    assert outcome.benchmark == "SPY"
+    assert outcome.raw_return == pytest.approx(0.10)
+    assert outcome.alpha_return == pytest.approx(0.05)
+    assert calculate_outcome(
+        "AAPL", "2026-01-05", config, as_of_date="2026-01-09"
+    ) is None
+
+
+def test_resolve_benchmark_prefers_explicit_then_suffix():
+    assert resolve_benchmark(
+        {"benchmark_ticker": "QQQ", "benchmark_map": {".T": "^N225", "": "SPY"}},
+        "7203.T",
+    ) == "QQQ"
+    assert resolve_benchmark(
+        {"benchmark_ticker": None, "benchmark_map": {".T": "^N225", "": "SPY"}},
+        "7203.T",
+    ) == "^N225"
+
+
+def test_calculate_outcome_rejects_non_five_session_window():
+    with pytest.raises(ValueError, match="holding_sessions must be 5"):
+        calculate_outcome("AAPL", "2026-01-05", {}, holding_sessions=4)
 
 
 def _make_pm_state(past_context=""):
@@ -507,6 +547,17 @@ class TestDeferredReflection:
         assert days == 5
         # resolution date = the bar `days` sessions after the trade date (#1251)
         assert resolved == "2026-01-10"
+
+    def test_fetch_returns_honors_benchmark_argument(self):
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            mock_ticker_cls.return_value.history.return_value = _price_df(
+                [100.0, 101.0, 102.0, 103.0, 104.0, 110.0]
+            )
+            TradingAgentsGraph._fetch_returns(
+                mock_graph, "AAPL", "2026-01-05", benchmark="^N225"
+            )
+        assert [call.args[0] for call in mock_ticker_cls.call_args_list] == ["AAPL", "^N225"]
 
     def test_fetch_returns_too_recent(self):
         """Only 1 data point available → returns all-None, no crash."""
