@@ -47,6 +47,19 @@ def test_as_of_excludes_lessons_resolved_after_the_run_date(tmp_path):
 
 
 @pytest.mark.unit
+def test_history_projects_outcomes_not_yet_known_as_pending(tmp_path):
+    log = _log(tmp_path)
+    _resolve(log, "NVDA", "2026-01-05", "2026-01-10", "future lesson")
+
+    entries, warnings = log.get_history(ticker="NVDA", as_of="2026-01-09")
+
+    assert warnings == []
+    assert entries[0]["pending"] is True
+    assert entries[0]["raw"] is None
+    assert entries[0]["reflection"] == ""
+
+
+@pytest.mark.unit
 def test_no_as_of_is_unfiltered_live_behavior(tmp_path):
     log = _log(tmp_path)
     _resolve(log, "NVDA", "2026-01-05", "2026-01-10", "great trade")

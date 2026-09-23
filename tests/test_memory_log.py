@@ -1,5 +1,6 @@
 """Tests for TradingMemoryLog — storage, deferred reflection, PM injection, legacy removal."""
 
+from concurrent.futures import ProcessPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -53,6 +54,94 @@ def _resolve_entry(log, ticker, date, decision, reflection="Good call."):
     """Store a decision then immediately resolve it via the API."""
     log.store_decision(ticker, date, decision)
     log.update_with_outcome(ticker, date, 0.05, 0.02, 5, reflection)
+
+
+def _store_in_process(path):
+    return TradingMemoryLog({"memory_log_path": str(path)}).store_decision(
+        "MSFT", "2026-01-05", DECISION_BUY, decision_id="run-b"
+    )
+
+
+def _resolve_in_process(path):
+    return TradingMemoryLog({"memory_log_path": str(path)}).resolve_decision(
+        decision_id="run-a", ticker="AAPL", trade_date="2026-01-05",
+        raw_return=0.10, alpha_return=0.05, holding_days=5,
+        benchmark_name="SPY", resolution_date="2026-01-10", reflection="Lesson.",
+    )
+
+
+def test_decision_identity_is_idempotent_and_preserved_on_resolution(tmp_path):
+    log = make_log(tmp_path)
+    assert log.store_decision("AAPL", "2026-01-05", DECISION_BUY, decision_id="run-1")
+    assert not log.store_decision("AAPL", "2026-01-05", DECISION_BUY, decision_id="run-1")
+    assert log.resolve_decision(
+        decision_id="run-1", ticker="AAPL", trade_date="2026-01-05",
+        raw_return=0.10, alpha_return=0.05, holding_days=5,
+        benchmark_name="SPY", resolution_date="2026-01-10", reflection="Lesson.",
+    ) == "updated"
+    entry = log.load_entries()[0]
+    assert entry["decision_id"] == "run-1"
+    assert entry["benchmark"] == "SPY"
+
+
+def test_history_projects_future_resolution_as_pending(tmp_path):
+    log = make_log(tmp_path)
+    log.store_decision("AAPL", "2026-01-05", DECISION_BUY, decision_id="run-1")
+    log.resolve_decision(
+        decision_id="run-1", ticker="AAPL", trade_date="2026-01-05",
+        raw_return=0.10, alpha_return=0.05, holding_days=5,
+        benchmark_name="SPY", resolution_date="2026-01-10", reflection="Lesson.",
+    )
+    entries, warnings = log.get_history(ticker="AAPL", as_of="2026-01-09")
+    assert warnings == []
+    assert entries[0]["pending"] is True
+    assert entries[0]["raw"] is None
+    assert entries[0]["reflection"] == ""
+
+
+def test_resolve_decision_is_idempotent_and_reports_conflicts(tmp_path):
+    log = make_log(tmp_path)
+    log.store_decision("AAPL", "2026-01-05", DECISION_BUY, decision_id="run-1")
+    params = {
+        "decision_id": "run-1", "ticker": "AAPL", "trade_date": "2026-01-05",
+        "raw_return": 0.10, "alpha_return": 0.05, "holding_days": 5,
+        "benchmark_name": "SPY", "resolution_date": "2026-01-10", "reflection": "Lesson.",
+    }
+    assert log.resolve_decision(**params) == "updated"
+    assert log.resolve_decision(**params) == "identical"
+    assert log.resolve_decision(**{**params, "raw_return": 0.11}) == "already_resolved"
+    assert log.resolve_decision(**{**params, "decision_id": "missing"}) == "missing"
+
+
+def test_duplicate_legacy_identity_is_ambiguous(tmp_path):
+    path = tmp_path / "trading_memory.md"
+    block = f"[2026-01-05 | AAPL | Buy | pending]\n\nDECISION:\n{DECISION_BUY}"
+    path.write_text(block + TradingMemoryLog._SEPARATOR + block + TradingMemoryLog._SEPARATOR)
+    log = TradingMemoryLog({"memory_log_path": str(path)})
+    entries, warnings = log.get_history(ticker="AAPL")
+    assert len(entries) == 2
+    assert any("ambiguous legacy identity" in warning for warning in warnings)
+
+
+def test_history_skips_malformed_block_with_warning(tmp_path):
+    path = tmp_path / "trading_memory.md"
+    path.write_text("not an entry" + TradingMemoryLog._SEPARATOR, encoding="utf-8")
+    entries, warnings = TradingMemoryLog({"memory_log_path": str(path)}).get_history()
+    assert entries == []
+    assert any("malformed memory entry" in warning for warning in warnings)
+
+
+def test_concurrent_append_and_update_preserve_both_entries(tmp_path):
+    path = tmp_path / "trading_memory.md"
+    TradingMemoryLog({"memory_log_path": str(path)}).store_decision(
+        "AAPL", "2026-01-05", DECISION_BUY, decision_id="run-a"
+    )
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_store_in_process, path), pool.submit(_resolve_in_process, path)]
+        assert [future.result() for future in futures] == [True, "updated"]
+    entries = TradingMemoryLog({"memory_log_path": str(path)}).load_entries()
+    assert {entry["decision_id"] for entry in entries} == {"run-a", "run-b"}
+    assert next(entry for entry in entries if entry["decision_id"] == "run-a")["pending"] is False
 
 
 def _price_df(prices, start="2026-01-05"):
@@ -515,7 +604,10 @@ class TestDeferredReflection:
         assert e["alpha"] == "+2.1%"
         assert e["holding"] == "5d"
         raw_text = (tmp_path / "trading_memory.md").read_text(encoding="utf-8")
-        assert "[2026-01-10 | NVDA | Buy | +4.2% | +2.1% | 5d]\n\nDECISION:" in raw_text
+        assert (
+            "[2026-01-10 | NVDA | Buy | +4.2% | +2.1% | 5d]\n\n"
+            "<!-- decision_id: " in raw_text
+        )
 
     # Reflector.reflect_on_final_decision
 
