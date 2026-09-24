@@ -104,6 +104,176 @@ def test_sdk_executes_and_cancels_workflow(tmp_path, monkeypatch):
     assert "RUN_CANCELLED" in after_cancel.content[0].text
 
 
+def test_installed_workflow_contract_with_restart(tmp_path, monkeypatch):
+    pytest.importorskip("mcp")
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from tests.test_plugin_workflow import valid_stage_output
+    from tradingagents.plugin import data
+    from tradingagents.plugin.server import create_server
+    from tradingagents.plugin.store import PluginStore
+
+    state_root = tmp_path / "state"
+    config = {
+        "memory_log_path": str(tmp_path / "memory.md"),
+        "results_dir": str(tmp_path / "results"),
+        "benchmark_ticker": None,
+        "benchmark_map": {"": "SPY"},
+    }
+    monkeypatch.setattr(data, "get_config", lambda: config)
+    monkeypatch.setattr(data, "resolve_instrument_identity", lambda ticker: {})
+
+    def fail_llm_factory(*args, **kwargs):
+        raise AssertionError("plugin workflow must not construct an LLM client")
+
+    monkeypatch.setattr("tradingagents.llm_clients.factory.create_llm_client", fail_llm_factory)
+
+    def structured(result):
+        value = result.structuredContent
+        return value.get("result", value)
+
+    server = create_server(state_root)
+
+    async def invoke():
+        async with create_connected_server_and_client_session(server) as client:
+            started = await client.call_tool("start_analysis", {
+                "request_id": "33333333-3333-4333-8333-333333333333",
+                "ticker": "AAPL",
+                "analysis_date": "2026-09-15",
+                "analysts": ["news"],
+                "research_rounds": 2,
+                "risk_rounds": 2,
+            })
+            run_id = structured(started)["run_id"]
+            first_view = structured(await client.call_tool("get_analysis", {"run_id": run_id}))
+            assert first_view["current_stage"] == "analyst/news"
+            first = await client.call_tool("submit_stage", {
+                "run_id": run_id,
+                "stage_id": first_view["current_stage"],
+                "expected_revision": first_view["revision"],
+                "output": valid_stage_output(first_view["current_stage"]),
+            })
+            assert not first.isError
+
+        # Reconstructing the server and store simulates a host restart with persisted state.
+        async with create_connected_server_and_client_session(create_server(state_root)) as client:
+            resumed = structured(await client.call_tool("get_analysis", {"run_id": run_id}))
+            assert any(section["stage_id"] == "analyst/news" for section in resumed["sections"])
+
+            validation_checked = False
+            while True:
+                view = structured(await client.call_tool("get_analysis", {"run_id": run_id}))
+                if view["status"] == "ready_to_finalize":
+                    break
+                assert view["instructions"]
+                if view["current_stage"] == "research/manager" and not validation_checked:
+                    invalid = await client.call_tool("submit_stage", {
+                        "run_id": run_id,
+                        "stage_id": view["current_stage"],
+                        "expected_revision": view["revision"],
+                        "output": {},
+                    })
+                    assert invalid.isError
+                    assert "VALIDATION_ERROR" in invalid.content[0].text
+                    assert "recommendation" in view["output_schema"]["properties"]
+                    after_invalid = structured(await client.call_tool("get_analysis", {
+                        "run_id": run_id,
+                    }))
+                    assert after_invalid["current_stage"] == view["current_stage"]
+                    assert after_invalid["revision"] == view["revision"]
+                    view = after_invalid
+                    validation_checked = True
+                result = await client.call_tool("submit_stage", {
+                    "run_id": run_id,
+                    "stage_id": view["current_stage"],
+                    "expected_revision": view["revision"],
+                    "output": valid_stage_output(view["current_stage"]),
+                })
+                assert not result.isError
+
+            assert validation_checked
+            finalized = structured(await client.call_tool("finalize_analysis", {"run_id": run_id}))
+            replayed = structured(await client.call_tool("finalize_analysis", {"run_id": run_id}))
+            return run_id, finalized, replayed
+
+    run_id, finalized, replayed = asyncio.run(invoke())
+    stage_ids = [output.stage_id for output in PluginStore(state_root).get_snapshot(run_id).outputs]
+    assert sum(stage_id.startswith("research/bull/") for stage_id in stage_ids) == 2
+    assert sum(stage_id.startswith("research/bear/") for stage_id in stage_ids) == 2
+    assert sum(stage_id.startswith("risk/") for stage_id in stage_ids) == 6
+    assert stage_ids.count("portfolio") == 1
+    assert finalized["status"] == "completed"
+    assert replayed["decision_id"] == finalized["decision_id"]
+    assert replayed["changed"] is False
+    assert replayed["complete_report_path"] == finalized["complete_report_path"]
+    assert replayed["section_paths"] == finalized["section_paths"]
+
+
+def test_reflection_is_completed_before_analysis_without_llm(tmp_path, monkeypatch):
+    pytest.importorskip("mcp")
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+    from tradingagents.graph.reflection import Outcome
+    from tradingagents.plugin import data, workflow
+    from tradingagents.plugin.server import create_server
+
+    config = {
+        "memory_log_path": str(tmp_path / "memory.md"),
+        "results_dir": str(tmp_path / "results"),
+        "benchmark_ticker": None,
+        "benchmark_map": {"": "SPY"},
+    }
+    monkeypatch.setattr(data, "get_config", lambda: config)
+    monkeypatch.setattr(data, "resolve_instrument_identity", lambda ticker: {})
+    monkeypatch.setattr(
+        workflow, "calculate_outcome",
+        lambda *_args, **_kwargs: Outcome(0.10, 0.05, 5, "SPY", "2026-09-10"),
+    )
+
+    def fail_llm_factory(*args, **kwargs):
+        raise AssertionError("plugin workflow must not construct an LLM client")
+
+    monkeypatch.setattr("tradingagents.llm_clients.factory.create_llm_client", fail_llm_factory)
+    TradingMemoryLog(config).store_decision(
+        "AAPL", "2026-09-01", "Buy with controlled sizing.", decision_id="decision-1",
+    )
+
+    def structured(result):
+        value = result.structuredContent
+        return value.get("result", value)
+
+    async def invoke():
+        async with create_connected_server_and_client_session(create_server(tmp_path / "state")) as client:
+            prepared = structured(await client.call_tool("prepare_reflections", {
+                "ticker": "AAPL", "as_of_date": "2026-09-10",
+            }))
+            assert len(prepared["jobs"]) == 1
+            job_id = prepared["jobs"][0]["run_id"]
+            reflection_view = structured(await client.call_tool("get_analysis", {"run_id": job_id}))
+            assert reflection_view["active_role"] == "reflection"
+            submitted = await client.call_tool("submit_stage", {
+                "run_id": job_id,
+                "stage_id": "reflection",
+                "expected_revision": reflection_view["revision"],
+                "output": "The call beat SPY. Keep the lesson.",
+            })
+            assert not submitted.isError
+            reflection_done = structured(await client.call_tool("finalize_analysis", {
+                "run_id": job_id,
+            }))
+            assert reflection_done["changed"] is True
+
+            started = structured(await client.call_tool("start_analysis", {
+                "request_id": "44444444-4444-4444-8444-444444444444",
+                "ticker": "AAPL", "analysis_date": "2026-09-10", "analysts": ["news"],
+            }))
+            return structured(await client.call_tool("get_analysis", {"run_id": started["run_id"]}))
+
+    analysis = asyncio.run(invoke())
+    assert "The call beat SPY. Keep the lesson." in analysis["lessons"]
+
+
 @pytest.mark.parametrize("extra", [
     {"llm_provider": "openai"},
     {"memory_log_path": "/tmp/unsupported-memory"},
