@@ -39,7 +39,16 @@ def test_trading_analysis_skill_is_discoverable():
     skill = (ROOT / "skills/trading-analysis/SKILL.md").read_text()
     assert skill.startswith("---\nname: trading-analysis\n")
     assert "description:" in skill.split("---", 2)[1]
+    for intent in (
+        "new full analysis",
+        "resume",
+        "standalone data retrieval",
+        "decision history",
+        "reflection",
+    ):
+        assert intent in skill
     for name in (
+        "get_capabilities",
         "prepare_reflections",
         "start_analysis",
         "get_analysis",
