@@ -25,10 +25,6 @@ python -m pip check
 command -v tradingagents-mcp
 ```
 
-The installed Codex host must see `tradingagents-mcp` on its `PATH`. If it does not, edit the
-local installed copy of `.mcp.json` and replace `tradingagents-mcp` with the absolute path printed
-by `command -v tradingagents-mcp` in that environment.
-
 Set a writable state directory before starting Codex:
 
 ```bash
@@ -76,12 +72,14 @@ its `plugins` array. The copy command updates files in place, including hidden f
 creating a nested `tradingagents` directory.
 
 Restart the Codex desktop app, open the Plugins Directory, choose **Local TradingAgents**, and
-install **tradingagents**. After activation, start a new Codex session. Verify discovery by calling
-`get_capabilities`, then make a standalone data request with an available data source. When the
-plugin changes, rerun `cp -R plugins/tradingagents/. "$HOME/.codex/plugins/tradingagents/"` from
-the repository root and restart Codex to refresh the installed local plugin. This replaces the
-installed `.mcp.json`; if you configured an absolute executable path there because Codex does not
-inherit the environment's `PATH`, reapply that path after every refresh.
+install **tradingagents**. The installed Codex host must see `tradingagents-mcp` on its `PATH`. If
+it does not, edit the installed plugin's `.mcp.json` and replace `tradingagents-mcp` with the
+absolute path printed by `command -v tradingagents-mcp` in that environment, then restart Codex
+again. After activation, start a new Codex session. Verify discovery by calling `get_capabilities`,
+then make a standalone data request with an available data source. When the plugin changes, rerun
+`cp -R plugins/tradingagents/. "$HOME/.codex/plugins/tradingagents/"` from the repository root,
+reapply that path after every refresh if you use an absolute executable override, and restart
+Codex to load the installed local plugin.
 
 Data-source availability varies by provider, credentials, and instrument. Codex subscription
 usage is controlled by the host and plugin activation does not grant unlimited model usage.
