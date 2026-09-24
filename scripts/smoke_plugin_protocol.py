@@ -32,6 +32,9 @@ EXPECTED_TOOLS = {
     "resolve_instrument_identity",
     "fetch_stocktwits_messages",
     "fetch_reddit_posts",
+    "finalize_analysis",
+    "prepare_reflections",
+    "get_decision_history",
 }
 
 
