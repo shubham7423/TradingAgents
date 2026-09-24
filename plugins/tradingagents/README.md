@@ -41,12 +41,39 @@ you have; never put credential values in plugin JSON. Set `TRADINGAGENTS_RESULTS
 the results root; its default depends on the installed package configuration. `.env` lookup also
 depends on the process launch working directory.
 
-## Activate
+## Activate from a personal marketplace
 
-Add this directory (`plugins/tradingagents`) as a personal local plugin marketplace source in
-Codex, then install/enable **tradingagents** from that marketplace. Start a new Codex session
-after activation. Verify discovery by calling `get_capabilities`, then make a standalone data
-request with an available data source.
+The plugin directory is not itself a marketplace. A personal marketplace needs a catalog at
+`~/.agents/plugins/marketplace.json`. From the repository root, copy the plugin under `~/.codex`
+and create a one-plugin catalog with a relative path to the copy:
+
+```bash
+mkdir -p "$HOME/.codex/plugins" "$HOME/.agents/plugins"
+cp -R plugins/tradingagents "$HOME/.codex/plugins/tradingagents"
+cat > "$HOME/.agents/plugins/marketplace.json" <<'JSON'
+{
+  "name": "local-tradingagents",
+  "interface": { "displayName": "Local TradingAgents" },
+  "plugins": [
+    {
+      "name": "tradingagents",
+      "source": { "source": "local", "path": "./.codex/plugins/tradingagents" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}
+JSON
+```
+
+If you already have a catalog, add this plugin object to its `plugins` array instead of replacing
+the file.
+
+Restart the Codex desktop app, open the Plugins Directory, choose **Local TradingAgents**, and
+install **tradingagents**. After activation, start a new Codex session. Verify discovery by calling
+`get_capabilities`, then make a standalone data request with an available data source. When the
+plugin changes, copy the updated directory to `~/.codex/plugins/tradingagents` and restart Codex
+so the installed local plugin refreshes.
 
 Data-source availability varies by provider, credentials, and instrument. Codex subscription
 usage is controlled by the host and plugin activation does not grant unlimited model usage.

@@ -21,3 +21,10 @@ def test_plugin_json_has_no_local_secrets_or_absolute_paths():
     text = "\n".join(path.read_text() for path in files)
     assert "/Users/" not in text and "/home/" not in text
     assert "API_KEY= " not in text and "sk-" not in text
+
+
+def test_readme_describes_a_personal_marketplace_catalog():
+    readme = (ROOT / "README.md").read_text()
+    assert "~/.agents/plugins/marketplace.json" in readme
+    assert '"path": "./.codex/plugins/tradingagents"' in readme
+    assert "Plugins Directory" in readme
