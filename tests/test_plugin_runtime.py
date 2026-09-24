@@ -112,6 +112,7 @@ def test_installed_workflow_contract_with_restart(tmp_path, monkeypatch):
     from tradingagents.plugin import data
     from tradingagents.plugin.server import create_server
     from tradingagents.plugin.store import PluginStore
+    from tradingagents.plugin.workflow import StageValidationError, prepare_output
 
     state_root = tmp_path / "state"
     config = {
@@ -167,20 +168,29 @@ def test_installed_workflow_contract_with_restart(tmp_path, monkeypatch):
                     break
                 assert view["instructions"]
                 if view["current_stage"] == "research/manager" and not validation_checked:
+                    invalid_output = valid_stage_output(view["current_stage"])
+                    invalid_output.pop("recommendation")
                     invalid = await client.call_tool("submit_stage", {
                         "run_id": run_id,
                         "stage_id": view["current_stage"],
                         "expected_revision": view["revision"],
-                        "output": {},
+                        "output": invalid_output,
                     })
                     assert invalid.isError
                     assert "VALIDATION_ERROR" in invalid.content[0].text
                     assert "recommendation" in view["output_schema"]["properties"]
+                    with pytest.raises(StageValidationError) as error:
+                        prepare_output(view["current_stage"], invalid_output)
+                    assert any(
+                        "recommendation" in issue["loc"]
+                        for issue in error.value.errors
+                    )
                     after_invalid = structured(await client.call_tool("get_analysis", {
                         "run_id": run_id,
                     }))
                     assert after_invalid["current_stage"] == view["current_stage"]
                     assert after_invalid["revision"] == view["revision"]
+                    assert after_invalid["sections"] == view["sections"]
                     view = after_invalid
                     validation_checked = True
                 result = await client.call_tool("submit_stage", {
@@ -194,9 +204,12 @@ def test_installed_workflow_contract_with_restart(tmp_path, monkeypatch):
             assert validation_checked
             finalized = structured(await client.call_tool("finalize_analysis", {"run_id": run_id}))
             replayed = structured(await client.call_tool("finalize_analysis", {"run_id": run_id}))
-            return run_id, finalized, replayed
+            history = structured(await client.call_tool("get_decision_history", {
+                "ticker": "AAPL", "as_of_date": "2026-09-15",
+            }))
+            return run_id, finalized, replayed, history
 
-    run_id, finalized, replayed = asyncio.run(invoke())
+    run_id, finalized, replayed, history = asyncio.run(invoke())
     stage_ids = [output.stage_id for output in PluginStore(state_root).get_snapshot(run_id).outputs]
     assert sum(stage_id.startswith("research/bull/") for stage_id in stage_ids) == 2
     assert sum(stage_id.startswith("research/bear/") for stage_id in stage_ids) == 2
@@ -207,6 +220,7 @@ def test_installed_workflow_contract_with_restart(tmp_path, monkeypatch):
     assert replayed["changed"] is False
     assert replayed["complete_report_path"] == finalized["complete_report_path"]
     assert replayed["section_paths"] == finalized["section_paths"]
+    assert sum(entry["decision_id"] == finalized["decision_id"] for entry in history["entries"]) == 1
 
 
 def test_reflection_is_completed_before_analysis_without_llm(tmp_path, monkeypatch):
