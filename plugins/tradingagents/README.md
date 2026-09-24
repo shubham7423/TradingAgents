@@ -79,7 +79,9 @@ Restart the Codex desktop app, open the Plugins Directory, choose **Local Tradin
 install **tradingagents**. After activation, start a new Codex session. Verify discovery by calling
 `get_capabilities`, then make a standalone data request with an available data source. When the
 plugin changes, rerun `cp -R plugins/tradingagents/. "$HOME/.codex/plugins/tradingagents/"` from
-the repository root and restart Codex to refresh the installed local plugin.
+the repository root and restart Codex to refresh the installed local plugin. This replaces the
+installed `.mcp.json`; if you configured an absolute executable path there because Codex does not
+inherit the environment's `PATH`, reapply that path after every refresh.
 
 Data-source availability varies by provider, credentials, and instrument. Codex subscription
 usage is controlled by the host and plugin activation does not grant unlimited model usage.
