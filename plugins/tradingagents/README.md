@@ -67,6 +67,14 @@ else
 fi
 ```
 
+For Codex CLI, activate the personal marketplace catalog and plugin with:
+
+```bash
+codex plugin marketplace add "$HOME/.agents/plugins"
+codex plugin add tradingagents@local-tradingagents
+codex plugin list
+```
+
 If you already have a catalog, the guarded command leaves it untouched; add the plugin object to
 its `plugins` array. The copy command updates files in place, including hidden files, without
 creating a nested `tradingagents` directory.

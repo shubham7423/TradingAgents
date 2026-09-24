@@ -178,6 +178,9 @@ def test_installed_workflow_contract_with_restart(tmp_path, monkeypatch):
                     })
                     assert invalid.isError
                     assert "VALIDATION_ERROR" in invalid.content[0].text
+                    assert "recommendation" in invalid.content[0].text
+                    assert "input_value" not in invalid.content[0].text
+                    assert "The debate is balanced." not in invalid.content[0].text
                     assert "recommendation" in view["output_schema"]["properties"]
                     with pytest.raises(StageValidationError) as error:
                         prepare_output(view["current_stage"], invalid_output)
