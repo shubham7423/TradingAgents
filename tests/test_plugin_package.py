@@ -27,4 +27,6 @@ def test_readme_describes_a_personal_marketplace_catalog():
     readme = (ROOT / "README.md").read_text()
     assert "~/.agents/plugins/marketplace.json" in readme
     assert '"path": "./.codex/plugins/tradingagents"' in readme
+    assert 'cp -R plugins/tradingagents/. "$HOME/.codex/plugins/tradingagents/"' in readme
+    assert 'if [ ! -e "$HOME/.agents/plugins/marketplace.json" ]; then' in readme
     assert "Plugins Directory" in readme

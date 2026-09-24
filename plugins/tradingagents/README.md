@@ -49,7 +49,9 @@ and create a one-plugin catalog with a relative path to the copy:
 
 ```bash
 mkdir -p "$HOME/.codex/plugins" "$HOME/.agents/plugins"
-cp -R plugins/tradingagents "$HOME/.codex/plugins/tradingagents"
+mkdir -p "$HOME/.codex/plugins/tradingagents"
+cp -R plugins/tradingagents/. "$HOME/.codex/plugins/tradingagents/"
+if [ ! -e "$HOME/.agents/plugins/marketplace.json" ]; then
 cat > "$HOME/.agents/plugins/marketplace.json" <<'JSON'
 {
   "name": "local-tradingagents",
@@ -64,16 +66,20 @@ cat > "$HOME/.agents/plugins/marketplace.json" <<'JSON'
   ]
 }
 JSON
+else
+  printf '%s\n' 'Marketplace catalog exists; add the plugin entry instead of replacing it.'
+fi
 ```
 
-If you already have a catalog, add this plugin object to its `plugins` array instead of replacing
-the file.
+If you already have a catalog, the guarded command leaves it untouched; add the plugin object to
+its `plugins` array. The copy command updates files in place, including hidden files, without
+creating a nested `tradingagents` directory.
 
 Restart the Codex desktop app, open the Plugins Directory, choose **Local TradingAgents**, and
 install **tradingagents**. After activation, start a new Codex session. Verify discovery by calling
 `get_capabilities`, then make a standalone data request with an available data source. When the
-plugin changes, copy the updated directory to `~/.codex/plugins/tradingagents` and restart Codex
-so the installed local plugin refreshes.
+plugin changes, rerun `cp -R plugins/tradingagents/. "$HOME/.codex/plugins/tradingagents/"` from
+the repository root and restart Codex to refresh the installed local plugin.
 
 Data-source availability varies by provider, credentials, and instrument. Codex subscription
 usage is controlled by the host and plugin activation does not grant unlimited model usage.
