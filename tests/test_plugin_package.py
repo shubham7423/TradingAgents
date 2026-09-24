@@ -31,3 +31,21 @@ def test_readme_describes_a_personal_marketplace_catalog():
     assert 'if [ ! -e "$HOME/.agents/plugins/marketplace.json" ]; then' in readme
     assert "reapply that path after every refresh" in readme
     assert "Plugins Directory" in readme
+
+
+def test_trading_analysis_skill_is_discoverable():
+    manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())
+    assert manifest["skills"] == "./skills/"
+    skill = (ROOT / "skills/trading-analysis/SKILL.md").read_text()
+    assert skill.startswith("---\nname: trading-analysis\n")
+    assert "description:" in skill.split("---", 2)[1]
+    for name in (
+        "prepare_reflections",
+        "start_analysis",
+        "get_analysis",
+        "submit_stage",
+        "finalize_analysis",
+        "list_analyses",
+        "get_decision_history",
+    ):
+        assert name in skill
