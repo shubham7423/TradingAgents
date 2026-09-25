@@ -153,8 +153,13 @@ class ReflectionFinalization:
 
 class StageValidationError(ValueError):
     def __init__(self, message: str, errors: list[dict] | None = None):
-        super().__init__(f"VALIDATION_ERROR: {message}")
         self.errors = [] if errors is None else errors
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in error.get('loc', ())) or 'output'}: "
+            f"{error.get('msg', 'invalid value')}"
+            for error in self.errors
+        )
+        super().__init__(f"VALIDATION_ERROR: {message}{f' ({details})' if details else ''}")
 
 
 class WorkflowService:

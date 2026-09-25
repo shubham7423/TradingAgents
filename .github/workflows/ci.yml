@@ -60,7 +60,7 @@ jobs:
       - run: python -m pip install ".[dev,plugin]"
       - run: python -m pip check
       - run: python scripts/smoke_plugin_protocol.py
-      - run: pytest tests/test_plugin_runtime.py tests/test_plugin_capabilities.py tests/test_plugin_store.py tests/test_plugin_data.py tests/test_shared_analyst_prompts.py tests/test_shared_synthesis.py -q
+      - run: pytest tests/test_plugin_package.py tests/test_plugin_runtime.py tests/test_plugin_capabilities.py tests/test_plugin_store.py tests/test_plugin_data.py tests/test_shared_analyst_prompts.py tests/test_shared_synthesis.py -q
 
   lint:
     name: ruff (strict, full repo)
