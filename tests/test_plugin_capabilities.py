@@ -79,7 +79,7 @@ def test_credentials_are_presence_only(monkeypatch):
         and result.data_sources[name].credential_present is None
         for name in ("yfinance", "polymarket", "stocktwits", "reddit")
     )
-    assert result.schema_version == 3
+    assert result.schema_version == 4
     assert result.analysis_settings.available is True
     assert result.analysis_settings.model_dump() == {
         "available": True,

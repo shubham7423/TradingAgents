@@ -49,7 +49,7 @@ class Capabilities(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runtime_version: str
-    schema_version: int = 3
+    schema_version: int = 4
     mcp_sdk_version: str | None
     available_tools: list[str]
     planned_data_tools: list[str]
