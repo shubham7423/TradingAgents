@@ -36,6 +36,11 @@ def test_fetch_chain_preserves_bid_ask_and_metadata(monkeypatch):
     assert result["contracts"][0]["contract_size"] == "REGULAR"
     assert result["contracts"][0]["last_trade_at"] == "2026-09-27T14:00:00+00:00"
     assert result["contracts"][0]["volume"] is None
+    assert result["contracts"][1]["bid"] == 1.2
+    assert result["contracts"][1]["ask"] == 1.4
+    assert result["contracts"][1]["currency"] == "USD"
+    assert result["contracts"][1]["contract_size"] == "REGULAR"
+    assert result["contracts"][1]["last_trade_at"] == "2026-09-27T14:01:00+00:00"
     json.dumps(result)
 
 
