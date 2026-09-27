@@ -1,6 +1,6 @@
 """Retrieve and normalize Yahoo Finance option chains."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import math
 import re
@@ -107,7 +107,9 @@ def evaluate_assessment(
         else:
             try:
                 traded = datetime.fromisoformat(last_trade.replace("Z", "+00:00"))
-                if (fetched - traded).days > 7:
+                fetched_utc = fetched.replace(tzinfo=timezone.utc) if fetched.tzinfo is None else fetched
+                traded_utc = traded.replace(tzinfo=timezone.utc) if traded.tzinfo is None else traded
+                if fetched_utc - traded_utc > timedelta(days=7):
                     warnings.append("Last trade was more than seven days before quote fetch; this is not quote age.")
             except (TypeError, ValueError):
                 warnings.append("Last trade time is unknown; this is not quote age.")
