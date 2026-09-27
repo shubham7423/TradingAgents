@@ -4,9 +4,15 @@ Status: proposed for user review (2026-09-27).
 
 ## Intent and scope
 
-Extend the local Codex plugin so a request to analyze one or more stock tickers for options reuses the existing full research workflow, then produces a concise, researched assessment of cash-secured puts and long calls. The user wants specific contracts from an option chain. The agent chooses and explains expiration; no fixed capital limit is assumed. Each candidate shows the cash required or premium at risk. The existing detailed stock report and API-backed CLI remain available.
+Extend the local Codex plugin with a dedicated `options-trading` skill. When a user asks to analyze one or more stock tickers for options, it reuses the existing full research workflow, then produces a concise, researched assessment of cash-secured puts and long calls. The user wants specific contracts from an option chain. The agent chooses and explains expiration; no fixed capital limit is assumed. Each candidate shows the cash required or premium at risk. The existing detailed stock report and API-backed CLI remain available.
 
 This is an opt-in follow-on to a completed stock analysis, not a new mandatory stage. For several tickers, the skill completes one analysis and options assessment per ticker, then gives a compact comparison. It may recommend no trade for a ticker or for both strategies. It never places an order.
+
+## Skill routing
+
+Add `plugins/tradingagents/skills/options-trading/SKILL.md` to the existing plugin skills directory. Its name and description target options requests such as “analyze AAPL for cash-secured puts,” “find a long call setup,” and “compare option trades for these tickers.” Codex sees the skill metadata when the plugin is installed and loads its full instructions when a request matches; the user can also invoke `$options-trading` explicitly. Ordinary stock analysis continues to use `trading-analysis` alone. The options skill loads and follows the existing `trading-analysis` skill for the stock research portion instead of copying its stage-by-stage instructions. It then calls the new option-chain and assessment tools. The plugin manifest already points to `./skills/`, so it needs no second plugin or manifest path.
+
+The options skill specifies the required inputs, when to reuse a completed same-day stock run, how to handle missing chain data, and the concise result format. The MCP server supplies quotes and enforces contract and arithmetic checks. Skill activation and results must be tested with direct options requests, indirect requests, ordinary stock requests that should not trigger it, and unavailable-data cases.
 
 ## Approach
 
@@ -25,11 +31,12 @@ The existing `yfinance` dependency supplies current listed expirations and chain
 
 ## Boundaries and state
 
-The skill coordinates the existing run and the new operations. Python owns quote retrieval, validation, calculations, and persistence. It does not construct an LLM client, use Codex credentials, submit a brokerage order, or forecast a probability of profit from implied volatility. Restrict option evidence to a completed run's ticker and a current, compatible analysis date. A quote snapshot has a stable identifier; submitted candidates must reference it. Persist it under the plugin state root using the existing SQLite store, with bounded size and run ownership. Save the memo under the run-owned report directory using an atomic write. Reject a conflicting retry rather than silently changing the quoted basis. The existing stock decision log and reflection math remain stock-oriented; an options suggestion is not recorded as if it were an executed trade or measured option return.
+The new options skill coordinates the existing run and the new operations. Python owns quote retrieval, validation, calculations, and persistence. It does not construct an LLM client, use Codex credentials, submit a brokerage order, or forecast a probability of profit from implied volatility. Restrict option evidence to a completed run's ticker and a current, compatible analysis date. A quote snapshot has a stable identifier; submitted candidates must reference it. Persist it under the plugin state root using the existing SQLite store, with bounded size and run ownership. Save the memo under the run-owned report directory using an atomic write. Reject a conflicting retry rather than silently changing the quoted basis. The existing stock decision log and reflection math remain stock-oriented; an options suggestion is not recorded as if it were an executed trade or measured option return.
 
 ## Verification and acceptance
 
 - A fixture-backed full plugin analysis can be followed by a specific cash-secured put or long call assessment and a short saved memo. A multi-ticker request yields one independent result per ticker and a compact comparison.
+- The installed plugin discovers `options-trading`; options requests select it, and ordinary stock requests continue through `trading-analysis`. Explicit `$options-trading` invocation works.
 - Tests cover no-trade, unavailable chains, historical-date rejection, wrong ticker/expiration/side, adjusted contracts, crossed or missing bid/ask, idempotent retries, and exact per-contract payoff arithmetic. External data is mocked.
 - Existing plugin analysis, report, and reflection tests continue to pass; `ruff check .` passes. A local Codex acceptance check exercises discovery, one completed stock run, chain retrieval, a saved memo, and recovery after interruption.
 
