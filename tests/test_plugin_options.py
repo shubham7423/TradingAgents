@@ -59,6 +59,8 @@ def test_evaluate_assessment_calculates_long_call_and_supports_no_trade():
                                             "No suitable contracts", [], None)
     assert no_trade["candidates"] == []
     assert no_trade["no_trade_reason"] == "No suitable contracts"
+    with pytest.raises(ValueError, match="no_trade_reason is required"):
+        options.evaluate_assessment("run-1", "AAPL", "Wait", [], None, None, [], None)
 
 
 @pytest.mark.parametrize(("change", "message"), [
