@@ -693,7 +693,11 @@ class PluginTools:
     @staticmethod
     def _option_symbol(run: RunRecord) -> str:
         symbol = run.instrument.get("canonical_symbol", "")
-        if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z][A-Z0-9-]{0,9}", symbol):
+        if (
+            not isinstance(symbol, str)
+            or crypto_base(symbol)
+            or not re.fullmatch(r"[A-Z][A-Z0-9-]{0,9}", symbol)
+        ):
             raise ValueError("options require a standard US stock or ETF symbol")
         return symbol
 
@@ -746,6 +750,15 @@ class PluginTools:
             None,
         )
         if snapshot is None:
+            try:
+                expirations = option_data.fetch_expirations(symbol)
+            except Exception as exc:
+                return {
+                    "status": "unavailable", "run_id": run_id, "expiration": expiration,
+                    "message": str(exc),
+                }
+            if expiration not in expirations:
+                raise ValueError(f"expiration {expiration} is unavailable for {symbol}")
             try:
                 payload = option_data.fetch_chain(symbol, expiration)
                 if payload["underlying"].get("currency") not in {None, "USD"} or any(

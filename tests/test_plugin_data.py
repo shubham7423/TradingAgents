@@ -1801,6 +1801,7 @@ def test_option_chain_provider_failure_is_unavailable_and_not_saved(tools, store
     run = _create_evidence_run(store)
     with sqlite3.connect(store.database_path) as connection:
         connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    monkeypatch.setattr(data.option_data, "fetch_expirations", lambda *_: ("2026-10-16",))
     monkeypatch.setattr(data.option_data, "fetch_chain", lambda *_: (_ for _ in ()).throw(RuntimeError("offline")))
     result = tools.get_option_chain(run.run_id, "2026-10-16")
     assert result["status"] == "unavailable"
@@ -1820,6 +1821,31 @@ def test_options_reject_non_current_or_crypto_run(tools, store, monkeypatch, ana
             )
     with pytest.raises(ValueError, match="options require"):
         tools.list_option_expirations(run.run_id)
+
+
+def test_options_reject_stock_labeled_crypto_symbol(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(
+        store,
+        instrument={"canonical_symbol": "BTC-USD", "source": "yfinance", "context": "Bitcoin"},
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    with pytest.raises(ValueError, match="US stock or ETF"):
+        tools.list_option_expirations(run.run_id)
+
+
+def test_option_chain_rejects_unlisted_expiration(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    monkeypatch.setattr(data.option_data, "fetch_expirations", lambda *_: ("2026-10-23",))
+    monkeypatch.setattr(
+        data.option_data, "fetch_chain", lambda *_: pytest.fail("unlisted expiration fetched")
+    )
+    with pytest.raises(ValueError, match="expiration .* unavailable"):
+        tools.get_option_chain(run.run_id, "2026-10-16")
 
 
 @pytest.mark.parametrize("expiration", ["not-a-date", "2026-09-14", "2026-10-16T00:00:00"])
