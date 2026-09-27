@@ -7,6 +7,42 @@ import pytest
 import tradingagents.plugin.options as options
 
 
+def test_evaluate_assessment_calculates_standard_option_economics():
+    run_id = "run-1"
+    put = {"strategy": "cash_secured_put", "snapshot_id": "snapshot-1",
+           "contract_symbol": "AAPL261016P00150000", "rationale": "Entry below support",
+           "expiry_rationale": "Allows thesis time", "failure_condition": "Support breaks"}
+    snapshot = {"snapshot_id": "snapshot-1", "run_id": run_id, "expiration": "2026-10-16",
+                "fetched_at": "2026-09-27T14:00:00Z", "payload": {"contracts": [
+                    {"contract_symbol": "AAPL261016P00150000", "side": "put", "strike": 150,
+                     "bid": 2.0, "ask": 2.2, "currency": "USD", "contract_size": "REGULAR"}]}}
+    result = options.evaluate_assessment(run_id, "AAPL", "Bullish above support", [put],
+                                         "cash_secured_put", None, [snapshot], None)
+    assert result["candidates"][0]["collateral"] == 15000
+    assert result["candidates"][0]["credit"] == 200
+    assert result["candidates"][0]["breakeven"] == 148
+    assert result["candidates"][0]["maximum_loss"] == 14800
+
+
+def test_evaluate_assessment_calculates_long_call_and_supports_no_trade():
+    call = {"strategy": "long_call", "snapshot_id": "snapshot-1",
+            "contract_symbol": "AAPL261016C00160000", "rationale": "Breakout continuation",
+            "expiry_rationale": "Allows thesis time", "failure_condition": "Breakout fails"}
+    snapshot = {"snapshot_id": "snapshot-1", "run_id": "run-1", "expiration": "2026-10-16",
+                "fetched_at": "2026-09-27T14:00:00Z", "payload": {"underlying": {}, "contracts": [
+                    {"contract_symbol": "AAPL261016C00160000", "side": "call", "strike": 160,
+                     "bid": 3.8, "ask": 4, "currency": "USD", "contract_size": "REGULAR"}]}}
+    result = options.evaluate_assessment("run-1", "AAPL", "Breakout thesis", [call],
+                                         "long_call", None, [snapshot], None)
+    assert result["candidates"][0]["debit"] == 400
+    assert result["candidates"][0]["maximum_loss"] == 400
+    assert result["candidates"][0]["breakeven"] == 164
+    no_trade = options.evaluate_assessment("run-1", "AAPL", "Wait", [], None,
+                                            "No suitable contracts", [], None)
+    assert no_trade["candidates"] == []
+    assert no_trade["no_trade_reason"] == "No suitable contracts"
+
+
 def test_fetch_chain_preserves_bid_ask_and_metadata(monkeypatch):
     put = {
         "contractSymbol": "AAPL261016P00150000", "strike": 150.0,

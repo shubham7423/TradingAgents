@@ -133,6 +133,7 @@ def get_capabilities() -> Capabilities:
             "list_option_expirations",
             "get_option_chain",
             "get_option_assessment",
+            "submit_option_assessment",
         ],
         planned_data_tools=[],
         roles=roles,

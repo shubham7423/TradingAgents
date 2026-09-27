@@ -1,5 +1,6 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -1788,6 +1789,69 @@ def test_option_tools_cache_chain_pages_for_completed_current_stock(tools, store
     assert first["next_offset"] == 1 and second["complete"] is True
     assert first["source"] == "Yahoo Finance" and first["fetched_at"]
     assert calls == [("AAPL", "2026-10-16")]
+
+
+def test_option_assessment_persists_replays_repairs_memo_and_conflicts(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    snapshot = store.save_option_snapshot(run.run_id, "2026-10-16", "2026-09-15T14:00:00Z", {
+        "underlying": {"regularMarketPrice": 155}, "contracts": [{
+            "contract_symbol": "AAPL261016P00150000", "side": "put", "strike": 150,
+            "bid": 2, "ask": 2.2, "currency": "USD", "contract_size": "REGULAR",
+        }],
+    })
+    candidate = {"strategy": "cash_secured_put", "snapshot_id": snapshot["snapshot_id"],
+                 "contract_symbol": "AAPL261016P00150000", "rationale": "Entry below support",
+                 "expiry_rationale": "Allows thesis time", "failure_condition": "Support breaks"}
+    submitted = tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
+                                               "cash_secured_put")
+    memo = Path(submitted["memo_path"])
+    assert memo.is_file() and "Collateral: $15000.00" in memo.read_text()
+    memo.unlink()
+    replay = tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
+                                            "cash_secured_put")
+    assert replay == submitted and memo.is_file()
+    with pytest.raises(RequestIdConflict):
+        tools.submit_option_assessment(run.run_id, "Changed thesis", [candidate], "cash_secured_put")
+    assert store.get_option_assessment(run.run_id) == submitted
+    assert data.PluginTools(PluginStore(store.database_path.parent)).get_option_assessment(run.run_id) == submitted
+
+
+def test_option_assessment_retry_recovers_after_atomic_memo_write_failure(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    snapshot = store.save_option_snapshot(run.run_id, "2026-10-16", "2026-09-15T14:00:00Z", {
+        "underlying": {}, "contracts": [{"contract_symbol": "AAPL261016P00150000", "side": "put",
+            "strike": 150, "bid": 2, "ask": 2.2, "currency": "USD", "contract_size": "REGULAR"}],
+    })
+    candidate = {"strategy": "cash_secured_put", "snapshot_id": snapshot["snapshot_id"],
+                 "contract_symbol": "AAPL261016P00150000", "rationale": "Entry below support",
+                 "expiry_rationale": "Allows thesis time", "failure_condition": "Support breaks"}
+    writer = data.PluginTools._write_option_memo
+    attempts = 0
+
+    def fail_once(path, content):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("disk temporarily unavailable")
+        writer(path, content)
+
+    monkeypatch.setattr(data.PluginTools, "_write_option_memo", staticmethod(fail_once))
+    with pytest.raises(OSError, match="temporarily"):
+        tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
+                                       "cash_secured_put")
+    receipt = store.get_option_assessment(run.run_id)
+    assert receipt is not None
+    assert not Path(receipt["memo_path"]).exists()
+    assert tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
+                                          "cash_secured_put") == receipt
+    assert Path(receipt["memo_path"]).is_file()
+    assert attempts == 2
 
 
 @pytest.mark.parametrize(("offset", "limit"), [(-1, 1), (0, 0), (0, 101)])

@@ -3,10 +3,13 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import re
+import tempfile
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import date, datetime, timezone
+from pathlib import Path
 from threading import Lock
 from typing import Annotated, Literal
 from uuid import UUID
@@ -40,6 +43,7 @@ from tradingagents.plugin.store import (
     AnalysisSnapshot,
     EvidenceRecord,
     PluginStore,
+    RequestIdConflict,
     RunNotFound,
     RunRecord,
     StageOutputRecord,
@@ -679,6 +683,7 @@ class PluginTools:
             self.list_option_expirations,
             self.get_option_chain,
             self.get_option_assessment,
+            self.submit_option_assessment,
         )
 
     def _require_current_completed_stock_run(self, run_id: str) -> RunRecord:
@@ -788,6 +793,96 @@ class PluginTools:
 
     def get_option_assessment(self, run_id: str) -> dict | None:
         return self._store.get_option_assessment(run_id)
+
+    def submit_option_assessment(
+        self, run_id: str, thesis: str, candidates: list[dict], preferred: str | None = None,
+        no_trade_reason: str | None = None,
+    ) -> dict:
+        run = self._require_current_completed_stock_run(run_id)
+        ticker = self._option_symbol(run)
+        submission = {"thesis": thesis, "candidates": candidates, "preferred": preferred,
+                      "no_trade_reason": no_trade_reason}
+        submission_hash = digest_json(submission)
+        receipt = self._store.get_option_assessment(run_id)
+        if receipt is not None:
+            if receipt["submission_hash"] != submission_hash:
+                raise RequestIdConflict(f"REQUEST_ID_CONFLICT: option assessment already submitted for {run_id}")
+            self._write_option_memo(receipt["memo_path"], receipt["result"]["memo_text"])
+            return receipt
+        snapshots_by_id = {item["snapshot_id"]: item for item in self._store.list_option_snapshots(run_id)}
+        selected = []
+        for candidate in candidates:
+            snapshot = snapshots_by_id.get(candidate.get("snapshot_id"))
+            if snapshot is None:
+                raise ValueError("candidate must reference a saved option snapshot for this run")
+            selected.append(snapshot)
+        verified_close = None
+        evidence_snapshot = self._store.get_snapshot(run_id)
+        for evidence in evidence_snapshot.evidence:
+            if evidence.tool_name != "get_verified_market_snapshot" or evidence.status != "success":
+                continue
+            try:
+                parsed = json.loads(evidence.content)
+                value = parsed.get("close") if isinstance(parsed, dict) else None
+                if value is not None and math.isfinite(float(value)):
+                    verified_close = float(value)
+                    break
+            except (ValueError, TypeError, json.JSONDecodeError):
+                match = re.search(r"^\|\s*Close\s*\|\s*\$?([0-9]+(?:\.[0-9]+)?)\s*\|$",
+                                  evidence.content, re.MULTILINE)
+                if match:
+                    verified_close = float(match.group(1))
+                    break
+        export = self._store.get_export_receipt(run_id)
+        report_path = export.complete_report_path if export else None
+        result = option_data.evaluate_assessment(
+            run_id, ticker, thesis, candidates, preferred, no_trade_reason, selected, verified_close
+        )
+        result["stock_report_path"] = report_path
+        lines = [f"# Options assessment: {ticker}", "", f"Thesis: {thesis.strip()}", ""]
+        if not candidates:
+            lines.append(f"No trade: {no_trade_reason.strip()}")
+        for item in result["candidates"]:
+            lines.extend([f"## {item['strategy']}: {item['contract_symbol']}",
+                          f"Source: {item['quote_source']} fetched {item['fetched_at']}",
+                          f"Bid/ask: ${item['bid']:.2f} / ${item['ask']:.2f}",
+                          f"Breakeven: ${item['breakeven']:.2f}; maximum loss: ${item['maximum_loss']:.2f}"])
+            if item["strategy"] == "cash_secured_put":
+                lines.append(f"Collateral: ${item['collateral']:.2f}; credit: ${item['credit']:.2f}")
+            else:
+                lines.append(f"Debit: ${item['debit']:.2f}")
+            lines.extend([f"Rationale: {item['rationale']}",
+                          f"Expiry: {item['expiry_rationale']}; failure: {item['failure_condition']}"])
+            lines.extend(f"Warning: {warning}" for warning in item["warnings"])
+            lines.append("")
+        if report_path:
+            lines.append(f"Stock report: {report_path}")
+        lines.extend(["", "Figures exclude fees and do not promise fills. No probability of profit is estimated."])
+        result["memo_text"] = "\n".join(lines).rstrip() + "\n"
+        report_dir = Path(export.report_dir) if export else (
+            Path(self._server_config.get("results_dir", "results")) / "plugin" / run_id
+        )
+        memo_path = str(report_dir / "options_memo.md")
+        receipt, _created = self._store.save_option_assessment(
+            run_id, submission_hash, result, memo_path, datetime.now(timezone.utc).isoformat()
+        )
+        self._write_option_memo(receipt["memo_path"], receipt["result"]["memo_text"])
+        return receipt
+
+    @staticmethod
+    def _write_option_memo(path: str, content: str) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".options_memo-", dir=target.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def get_stock_data(
         self,

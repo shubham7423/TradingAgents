@@ -35,6 +35,7 @@ EXPECTED_TOOLS = {
     "list_option_expirations",
     "get_option_chain",
     "get_option_assessment",
+    "submit_option_assessment",
 }
 
 
@@ -194,6 +195,7 @@ expected_tools = {
     "get_macro_indicators", "get_prediction_markets", "resolve_instrument_identity",
     "fetch_stocktwits_messages", "fetch_reddit_posts",
     "list_option_expirations", "get_option_chain", "get_option_assessment",
+    "submit_option_assessment",
 }
 assert set(get_capabilities().available_tools) == expected_tools
 assert "tradingagents.graph.trading_graph" not in sys.modules
