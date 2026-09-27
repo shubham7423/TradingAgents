@@ -798,17 +798,18 @@ class PluginTools:
         self, run_id: str, thesis: str, candidates: list[dict], preferred: str | None = None,
         no_trade_reason: str | None = None,
     ) -> dict:
-        run = self._require_current_completed_stock_run(run_id)
-        ticker = self._option_symbol(run)
         submission = {"thesis": thesis, "candidates": candidates, "preferred": preferred,
                       "no_trade_reason": no_trade_reason}
         submission_hash = digest_json(submission)
         receipt = self._store.get_option_assessment(run_id)
         if receipt is not None:
+            _require_compatible_run(self._store.get_run(run_id))
             if receipt["submission_hash"] != submission_hash:
                 raise RequestIdConflict(f"REQUEST_ID_CONFLICT: option assessment already submitted for {run_id}")
             self._write_option_memo(receipt["memo_path"], receipt["result"]["memo_text"])
             return receipt
+        run = self._require_current_completed_stock_run(run_id)
+        ticker = self._option_symbol(run)
         snapshots_by_id = {item["snapshot_id"]: item for item in self._store.list_option_snapshots(run_id)}
         selected = []
         for candidate in candidates:
@@ -840,10 +841,14 @@ class PluginTools:
         )
         result["stock_report_path"] = report_path
         lines = [f"# Options assessment: {ticker}", "", f"Thesis: {thesis.strip()}", ""]
+        if preferred:
+            lines.append(f"Preferred strategy: {preferred}")
+            lines.append("")
         if not candidates:
             lines.append(f"No trade: {no_trade_reason.strip()}")
         for item in result["candidates"]:
             lines.extend([f"## {item['strategy']}: {item['contract_symbol']}",
+                          f"Expiration: {item['expiration']}; strike: ${item['strike']:.2f}",
                           f"Source: {item['quote_source']} fetched {item['fetched_at']}",
                           f"Bid/ask: ${item['bid']:.2f} / ${item['ask']:.2f}",
                           f"Breakeven: ${item['breakeven']:.2f}; maximum loss: ${item['maximum_loss']:.2f}"])

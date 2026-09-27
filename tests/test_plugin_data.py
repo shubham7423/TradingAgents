@@ -1808,7 +1808,10 @@ def test_option_assessment_persists_replays_repairs_memo_and_conflicts(tools, st
     submitted = tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
                                                "cash_secured_put")
     memo = Path(submitted["memo_path"])
-    assert memo.is_file() and "Collateral: $15000.00" in memo.read_text()
+    memo_text = memo.read_text()
+    assert memo.is_file() and "Collateral: $15000.00" in memo_text
+    assert "Expiration: 2026-10-16; strike: $150.00" in memo_text
+    assert "Preferred strategy: cash_secured_put" in memo_text
     memo.unlink()
     replay = tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
                                             "cash_secured_put")
@@ -1848,10 +1851,13 @@ def test_option_assessment_retry_recovers_after_atomic_memo_write_failure(tools,
     receipt = store.get_option_assessment(run.run_id)
     assert receipt is not None
     assert not Path(receipt["memo_path"]).exists()
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-16")
     assert tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
                                           "cash_secured_put") == receipt
     assert Path(receipt["memo_path"]).is_file()
     assert attempts == 2
+    with pytest.raises(RequestIdConflict):
+        tools.submit_option_assessment(run.run_id, "Changed thesis", [candidate], "cash_secured_put")
 
 
 @pytest.mark.parametrize(("offset", "limit"), [(-1, 1), (0, 0), (0, 101)])
