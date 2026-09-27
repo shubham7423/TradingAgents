@@ -58,3 +58,20 @@ def test_trading_analysis_skill_is_discoverable():
         "get_decision_history",
     ):
         assert name in skill
+
+
+def test_options_trading_skill_is_discoverable():
+    manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())
+    assert manifest["skills"] == "./skills/"
+    stock_skill = ROOT / "skills/trading-analysis/SKILL.md"
+    options_path = ROOT / "skills/options-trading/SKILL.md"
+    assert stock_skill.is_file() and options_path.is_file()
+    skill = options_path.read_text()
+    assert skill.startswith("---\nname: options-trading\n")
+    description = skill.split("---", 2)[1].lower()
+    assert "options" in description and "cash-secured put" in description and "long call" in description
+    assert "ordinary stock analysis" not in description
+    for name in ("list_option_expirations", "get_option_chain", "submit_option_assessment",
+                 "get_option_assessment"):
+        assert name in skill
+    assert "place an order" in skill.lower()
