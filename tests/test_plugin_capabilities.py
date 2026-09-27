@@ -32,6 +32,9 @@ EXPECTED_TOOLS = {
     "resolve_instrument_identity",
     "fetch_stocktwits_messages",
     "fetch_reddit_posts",
+    "list_option_expirations",
+    "get_option_chain",
+    "get_option_assessment",
 }
 
 
@@ -170,6 +173,11 @@ def test_create_server_registers_public_tools(tmp_path):
         {"type": "string"},
         {"additionalProperties": True, "type": "object"},
     ]
+    option_chain = next(tool for tool in registered if tool.name == "get_option_chain")
+    properties = option_chain.inputSchema["properties"]
+    assert properties["offset"]["minimum"] == 0
+    assert properties["limit"]["minimum"] == 1
+    assert properties["limit"]["maximum"] == 100
 
 
 def test_discovery_imports_without_runner_or_global_config(tmp_path):
@@ -185,6 +193,7 @@ expected_tools = {
     "get_news", "get_global_news", "get_insider_transactions",
     "get_macro_indicators", "get_prediction_markets", "resolve_instrument_identity",
     "fetch_stocktwits_messages", "fetch_reddit_posts",
+    "list_option_expirations", "get_option_chain", "get_option_assessment",
 }
 assert set(get_capabilities().available_tools) == expected_tools
 assert "tradingagents.graph.trading_graph" not in sys.modules

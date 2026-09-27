@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import date, datetime, timezone
 from threading import Lock
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -35,6 +35,7 @@ from tradingagents.dataflows.symbol_utils import NoMarketDataError, crypto_base,
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.graph.analyst_execution import ANALYST_NODE_SPECS
 from tradingagents.graph.reflection import build_reflection_messages
+from tradingagents.plugin import options as option_data
 from tradingagents.plugin.store import (
     AnalysisSnapshot,
     EvidenceRecord,
@@ -675,7 +676,105 @@ class PluginTools:
             self.get_prediction_markets,
             self.fetch_stocktwits_messages,
             self.fetch_reddit_posts,
+            self.list_option_expirations,
+            self.get_option_chain,
+            self.get_option_assessment,
         )
+
+    def _require_current_completed_stock_run(self, run_id: str) -> RunRecord:
+        run = self._store.get_run(run_id)
+        _require_compatible_run(run)
+        if run.status != "completed" or run.normalized_inputs["asset_type"] != "stock":
+            raise ValueError("options require a completed stock analysis")
+        if run.normalized_inputs["analysis_date"] != get_current_date():
+            raise ValueError("options require a current-date stock analysis")
+        return run
+
+    @staticmethod
+    def _option_symbol(run: RunRecord) -> str:
+        symbol = run.instrument.get("canonical_symbol", "")
+        if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z][A-Z0-9-]{0,9}", symbol):
+            raise ValueError("options require a standard US stock or ETF symbol")
+        return symbol
+
+    def list_option_expirations(self, run_id: str) -> dict:
+        run = self._require_current_completed_stock_run(run_id)
+        symbol = self._option_symbol(run)
+        try:
+            expirations = option_data.fetch_expirations(symbol)
+        except Exception as exc:
+            return {
+                "status": "unavailable", "run_id": run_id, "symbol": symbol,
+                "expirations": [], "message": str(exc),
+            }
+        today = date.fromisoformat(get_current_date())
+        valid = []
+        for expiration in expirations:
+            try:
+                parsed = date.fromisoformat(expiration)
+            except (TypeError, ValueError):
+                continue
+            if parsed.isoformat() == expiration and parsed >= today:
+                valid.append(expiration)
+        return {
+            "status": "success", "run_id": run_id, "symbol": symbol,
+            "expirations": valid, "source": "Yahoo Finance",
+        }
+
+    def get_option_chain(
+        self,
+        run_id: str,
+        expiration: str,
+        offset: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=1, le=100)] = 100,
+    ) -> dict:
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        try:
+            parsed = date.fromisoformat(expiration)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("expiration must be a valid ISO date") from exc
+        if parsed.isoformat() != expiration or parsed < date.fromisoformat(get_current_date()):
+            raise ValueError("expiration must be a current or future date")
+        run = self._require_current_completed_stock_run(run_id)
+        symbol = self._option_symbol(run)
+        snapshot = next(
+            (item for item in self._store.list_option_snapshots(run_id)
+             if item["expiration"] == expiration),
+            None,
+        )
+        if snapshot is None:
+            try:
+                payload = option_data.fetch_chain(symbol, expiration)
+                if payload["underlying"].get("currency") not in {None, "USD"} or any(
+                    row.get("currency") != "USD" or row.get("contract_size") != "REGULAR"
+                    for row in payload["contracts"]
+                ):
+                    raise ValueError("only USD standard 100-share contracts are supported")
+                snapshot = self._store.save_option_snapshot(
+                    run_id, expiration, datetime.now(timezone.utc).isoformat(), payload
+                )
+            except Exception as exc:
+                return {
+                    "status": "unavailable", "run_id": run_id, "expiration": expiration,
+                    "message": str(exc),
+                }
+        contracts = snapshot["payload"]["contracts"]
+        page = contracts[offset:offset + limit]
+        end = offset + len(page)
+        complete = end >= len(contracts)
+        return {
+            "status": "success", "snapshot_id": snapshot["snapshot_id"],
+            "fetched_at": snapshot["fetched_at"], "expiration": expiration,
+            "underlying": snapshot["payload"]["underlying"], "source": "Yahoo Finance",
+            "contracts": page, "next_offset": None if complete else end,
+            "complete": complete,
+        }
+
+    def get_option_assessment(self, run_id: str) -> dict | None:
+        return self._store.get_option_assessment(run_id)
 
     def get_stock_data(
         self,

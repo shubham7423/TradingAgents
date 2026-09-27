@@ -37,6 +37,9 @@ EXPECTED_TOOLS = {
     "resolve_instrument_identity",
     "fetch_stocktwits_messages",
     "fetch_reddit_posts",
+    "list_option_expirations",
+    "get_option_chain",
+    "get_option_assessment",
 }
 
 

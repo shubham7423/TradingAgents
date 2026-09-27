@@ -1762,3 +1762,68 @@ def test_finalize_analysis_is_public_and_strict(store, monkeypatch):
     assert tools.finalize_analysis in tools.public_operations()
     with pytest.raises(ValidationError):
         data.AnalysisFinalizationResult.model_validate({**result.model_dump(), "extra": True})
+
+
+def test_option_tools_cache_chain_pages_for_completed_current_stock(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    monkeypatch.setattr(data.option_data, "fetch_expirations", lambda symbol: ("2026-10-16",))
+    rows = [
+        {"contract_symbol": f"AAPL-{i}", "currency": "USD", "contract_size": "REGULAR"}
+        for i in range(2)
+    ]
+    calls = []
+    monkeypatch.setattr(data.option_data, "fetch_chain", lambda symbol, expiration: (
+        calls.append((symbol, expiration)) or {
+            "expiration": expiration, "underlying": {"symbol": symbol}, "contracts": rows,
+        }
+    ))
+
+    assert tools.list_option_expirations(run.run_id)["expirations"] == ["2026-10-16"]
+    first = tools.get_option_chain(run.run_id, "2026-10-16", limit=1)
+    second = tools.get_option_chain(run.run_id, "2026-10-16", offset=first["next_offset"], limit=1)
+    assert first["snapshot_id"] == second["snapshot_id"]
+    assert first["next_offset"] == 1 and second["complete"] is True
+    assert first["source"] == "Yahoo Finance" and first["fetched_at"]
+    assert calls == [("AAPL", "2026-10-16")]
+
+
+@pytest.mark.parametrize(("offset", "limit"), [(-1, 1), (0, 0), (0, 101)])
+def test_option_chain_bounds(tools, offset, limit):
+    with pytest.raises(ValueError):
+        tools.get_option_chain("unknown", "2026-10-16", offset, limit)
+
+
+def test_option_chain_provider_failure_is_unavailable_and_not_saved(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    monkeypatch.setattr(data.option_data, "fetch_chain", lambda *_: (_ for _ in ()).throw(RuntimeError("offline")))
+    result = tools.get_option_chain(run.run_id, "2026-10-16")
+    assert result["status"] == "unavailable"
+    assert store.list_option_snapshots(run.run_id) == []
+
+
+@pytest.mark.parametrize("analysis_date", ["2026-09-14", "2026-09-15"])
+def test_options_reject_non_current_or_crypto_run(tools, store, monkeypatch, analysis_date):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store, analysis_date=analysis_date)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+        if analysis_date == "2026-09-15":
+            connection.execute(
+                "UPDATE runs SET normalized_inputs_json = json_set(normalized_inputs_json, '$.asset_type', 'crypto') WHERE run_id = ?",
+                (run.run_id,),
+            )
+    with pytest.raises(ValueError, match="options require"):
+        tools.list_option_expirations(run.run_id)
+
+
+@pytest.mark.parametrize("expiration", ["not-a-date", "2026-09-14", "2026-10-16T00:00:00"])
+def test_option_chain_rejects_invalid_or_expired_expiration(tools, monkeypatch, expiration):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    with pytest.raises(ValueError, match="expiration"):
+        tools.get_option_chain("unused", expiration)
