@@ -23,6 +23,9 @@ Show the quote source and fetch time; last trade time is not quote time. Cash-se
 use bid, with collateral `strike × 100`, credit `bid × 100`, breakeven `strike − bid`, and
 worst-case loss `(strike − bid) × 100`. Long calls use ask, with debit and maximum loss
 `ask × 100` and breakeven `strike + ask`. Figures exclude fees and do not promise fills.
-No-trade is valid. On source failure or unsupported tickers, report `no trade/unavailable`
-and the run ID. Show the saved short memo and link the full stock report; for multiple
+No-trade is valid. If an expiration or chain source fails for a valid completed stock run,
+submit an assessment with an empty `candidates` list and the source failure as
+`no_trade_reason`, then call `get_option_assessment` and show its saved memo and the run ID.
+If the runtime rejects an unsupported ticker, report `unavailable` and the run ID; do not
+submit an assessment. Show the saved short memo and link the full stock report; for multiple
 tickers, add a compact comparison. Never place an order.

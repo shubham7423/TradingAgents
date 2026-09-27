@@ -42,3 +42,23 @@ covered by this task.
 
 The commit contains only the Task 5 skill, docs, protocol expectation, tests, and this report.
 Existing unrelated README and `.superpowers/brainstorm/` changes were not included.
+
+## Round 1 follow-up
+
+Changed source-failure handling so a valid completed stock run submits an empty-candidate
+assessment with the source failure as `no_trade_reason`, reads the saved assessment, and shows
+the memo. Unsupported tickers remain reported as unavailable after runtime rejection.
+
+Exact focused check:
+
+```text
+Command: .venv/bin/pytest tests/test_plugin_package.py tests/test_plugin_runtime.py -q
+Output:
+...................                                                      [100%]
+=============================== warnings summary ===============================
+tests/test_plugin_runtime.py::test_sdk_executes_and_cancels_workflow
+  /Users/shubhammpatel/.codex/worktrees/codex-options-assessment/TradingAgents/.venv/lib/python3.13/site-packages/pydantic_settings/sources/utils.py:47: IncompleteFieldDefinitionWarning: Field 'lifespan' has an incomplete definition: its annotation contains an unresolved forward reference, so settings sources may fail to correctly resolve it. Call `model_rebuild()` on the model where the field is defined, once all referenced types are defined.
+    warnings.warn(
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+19 passed, 1 warning in 2.39s
+```
