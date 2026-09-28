@@ -35,6 +35,10 @@ EXPECTED_TOOLS = {
     "finalize_analysis",
     "prepare_reflections",
     "get_decision_history",
+    "list_option_expirations",
+    "get_option_chain",
+    "get_option_assessment",
+    "submit_option_assessment",
 }
 
 

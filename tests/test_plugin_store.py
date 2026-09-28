@@ -289,7 +289,7 @@ def test_incompatible_schema_is_rejected_without_mutation(tmp_path):
 
     with pytest.raises(
         IncompatibleState,
-        match="INCOMPATIBLE_STATE: database schema 999 is not supported; expected 3",
+        match="INCOMPATIBLE_STATE: database schema 999 is not supported; expected 4",
     ):
         PluginStore(tmp_path)
 
@@ -314,7 +314,7 @@ def test_v1_database_migrates_without_losing_run_or_evidence(tmp_path):
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='schema_version'"
-        ).fetchone()[0] == "3"
+        ).fetchone()[0] == "4"
 
 
 def test_v2_database_migrates_to_export_and_reflection_tables(tmp_path):
@@ -324,11 +324,61 @@ def test_v2_database_migrates_to_export_and_reflection_tables(tmp_path):
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='schema_version'"
-        ).fetchone()[0] == "3"
+        ).fetchone()[0] == "4"
         names = {row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
-    assert {"export_receipts", "reflection_jobs"} <= names
+    assert {"export_receipts", "reflection_jobs", "option_snapshots", "option_assessments"} <= names
+
+
+def test_v3_database_migrates_with_run_and_option_records_surviving_restart(tmp_path):
+    store = PluginStore(tmp_path)
+    run = ready_run(store)
+    _set_run_fields(store, run.run_id, status="completed")
+    run = store.get_run(run.run_id)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE metadata SET value='3' WHERE key='schema_version'")
+        connection.execute("DROP TABLE option_snapshots")
+        connection.execute("DROP TABLE option_assessments")
+
+    migrated = PluginStore(tmp_path)
+    assert migrated.get_run(run.run_id) == run
+    snapshot = migrated.save_option_snapshot(
+        run.run_id, "2026-10-16", "2026-09-27T12:00:00+00:00", {"calls": [1]}
+    )
+    assert migrated.save_option_snapshot(
+        run.run_id, "2026-10-16", "later", {"calls": [2]}
+    ) == snapshot
+    result = {"memo": "No trade: no usable quotes.", "calculations": {"contracts": 0}}
+    memo_path = f"/results/plugin/{run.run_id}/options_memo.md"
+    first, created = migrated.save_option_assessment(
+        run.run_id, "same-hash", result, memo_path, "2026-09-27T12:00:00+00:00"
+    )
+
+    reopened = PluginStore(tmp_path)
+    assert reopened.get_option_snapshot(snapshot["snapshot_id"]) == snapshot
+    assert reopened.list_option_snapshots(run.run_id) == [snapshot]
+    assert reopened.get_option_assessment(run.run_id) == first
+    again, repeated = reopened.save_option_assessment(
+        run.run_id, "same-hash", result, memo_path, "2026-09-27T12:00:00+00:00"
+    )
+    assert created and not repeated and first == again
+    with pytest.raises(RequestIdConflict):
+        reopened.save_option_assessment(
+            run.run_id, "different-hash", result, memo_path, "2026-09-27T12:00:00+00:00"
+        )
+
+
+def test_concurrent_option_assessment_writers_share_canonical_receipt(tmp_path):
+    store = PluginStore(tmp_path)
+    run = ready_run(store)
+    args = (run.run_id, "same-hash", {"memo": "No trade."}, "/memo.md", "now")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(lambda _: PluginStore(tmp_path).save_option_assessment(*args), range(2))
+        )
+    assert results[0][0] == results[1][0]
+    assert sorted(created for _, created in results) == [False, True]
 
 
 def test_reflection_job_is_unique_by_decision_and_survives_restart(tmp_path):

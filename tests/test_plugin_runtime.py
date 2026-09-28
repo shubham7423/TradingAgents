@@ -37,6 +37,10 @@ EXPECTED_TOOLS = {
     "resolve_instrument_identity",
     "fetch_stocktwits_messages",
     "fetch_reddit_posts",
+    "list_option_expirations",
+    "get_option_chain",
+    "get_option_assessment",
+    "submit_option_assessment",
 }
 
 
@@ -510,3 +514,67 @@ def test_stdio_protocol_stdout_is_json_rpc(tmp_path):
     assert all(response["jsonrpc"] == "2.0" for response in responses)
     assert [response["id"] for response in responses] == [1, 2]
     assert {tool["name"] for tool in responses[1]["result"]["tools"]} == EXPECTED_TOOLS
+
+
+def test_option_assessment_readback_and_unavailable_chain_over_mcp(tmp_path, monkeypatch):
+    pytest.importorskip("mcp")
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from tradingagents.plugin import data
+    from tradingagents.plugin.server import create_server
+
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-27")
+    monkeypatch.setattr(data, "resolve_instrument_identity", lambda ticker: {
+        "canonical_symbol": ticker, "company_name": "Apple Inc.", "exchange": "NASDAQ",
+        "currency": "USD",
+    })
+    monkeypatch.setattr(data.option_data, "fetch_expirations", lambda _symbol: ("2026-10-16",))
+    monkeypatch.setattr(data.option_data, "fetch_chain", lambda *_: (_ for _ in ()).throw(
+        RuntimeError("fixture source unavailable")
+    ))
+
+    def structured(result):
+        value = result.structuredContent
+        if value is None:
+            value = json.loads(result.content[0].text)
+        return value.get("result", value)
+
+    state_dir = tmp_path / "state"
+    server = create_server(state_dir)
+
+    async def invoke():
+        async with create_connected_server_and_client_session(server) as client:
+            start_result = await client.call_tool("start_analysis", {
+                "request_id": "77777777-7777-4777-8777-777777777777",
+                "ticker": "AAPL", "analysis_date": "2026-09-27", "analysts": ["news"],
+                "skip_reflections": True,
+            })
+            assert not start_result.isError, start_result.content
+            started = structured(start_result)
+            with sqlite3.connect(state_dir / "plugin.sqlite3") as connection:
+                connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?",
+                                   (started["run_id"],))
+            unavailable_result = await client.call_tool("get_option_chain", {
+                "run_id": started["run_id"], "expiration": "2026-10-16",
+            })
+            assert not unavailable_result.isError, unavailable_result.content
+            unavailable = structured(unavailable_result)
+            saved_result = await client.call_tool("submit_option_assessment", {
+                "run_id": started["run_id"], "thesis": "No suitable risk/reward.",
+                "candidates": [], "no_trade_reason": "No contract meets the thesis.",
+            })
+            assert not saved_result.isError, saved_result.content
+            saved = structured(saved_result)
+            readback = structured(await client.call_tool("get_option_assessment", {
+                "run_id": started["run_id"],
+            }))
+            tools = await client.list_tools()
+            return unavailable, saved, readback, {tool.name for tool in tools.tools}
+
+    unavailable, saved, readback, discovered = asyncio.run(invoke())
+    assert unavailable["status"] == "unavailable"
+    assert saved["run_id"] and "No contract meets the thesis." in saved["memo_text"]
+    assert readback["result"] == saved
+    assert {"list_option_expirations", "get_option_chain", "submit_option_assessment",
+            "get_option_assessment"} <= discovered
+    assert not any("order" in name.lower() for name in discovered)

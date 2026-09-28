@@ -114,3 +114,15 @@ LLM; finalization updates the identified decision once and is retryable.
 `learning_omitted=true` in the run result. Automatic preparation and completion of reflections
 before a new analysis is intentionally deferred to US-017's skill orchestration; the runtime does
 not launch that workflow itself.
+
+## Options assessments
+
+Use the `options-trading` skill for a specific cash-secured put, long call, or options comparison;
+stock-only requests remain with `trading-analysis`. Invoke it explicitly with `$options-trading`
+when needed. It uses a completed same-day stock run and current Yahoo Finance option chains.
+Historical option-chain reconstruction and crypto options are unsupported. Quote source and fetch
+time are shown, and a new run is required to refresh quotes. The plugin saves one assessment per
+run, supports identical replay, rejects conflicts, and never places orders. Payoff figures exclude
+fees and do not promise fills. The assessment memo is saved alongside the full stock report.
+
+Refresh the local plugin and restart Codex after changing the skill.

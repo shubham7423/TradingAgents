@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class RequestIdConflict(RuntimeError):
@@ -267,7 +267,7 @@ class PluginStore:
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()
             version = None if row is None else row["value"]
-            if version not in {"1", "2", str(SCHEMA_VERSION)}:
+            if version not in {"1", "2", "3", str(SCHEMA_VERSION)}:
                 raise IncompatibleState(
                     "INCOMPATIBLE_STATE: database schema "
                     f"{version} is not supported; expected {SCHEMA_VERSION}"
@@ -278,6 +278,9 @@ class PluginStore:
                 version = "2"
             if version == "2":
                 self._migrate_v2(connection)
+                version = "3"
+            if version == "3":
+                self._migrate_v3(connection)
 
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -370,6 +373,21 @@ class PluginStore:
                 updated_at TEXT NOT NULL,
                 completed_at TEXT
             );
+            CREATE TABLE option_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                expiration TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE (run_id, expiration)
+            );
+            CREATE TABLE option_assessments (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                submission_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                memo_path TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            );
             """
         )
         connection.execute(
@@ -444,6 +462,20 @@ class PluginStore:
         )""")
         connection.execute("UPDATE metadata SET value = '3' WHERE key = 'schema_version'")
 
+    def _migrate_v3(self, connection: sqlite3.Connection) -> None:
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        connection.execute("""CREATE TABLE option_snapshots (
+            snapshot_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(run_id),
+            expiration TEXT NOT NULL, fetched_at TEXT NOT NULL, payload_json TEXT NOT NULL,
+            UNIQUE (run_id, expiration)
+        )""")
+        connection.execute("""CREATE TABLE option_assessments (
+            run_id TEXT PRIMARY KEY REFERENCES runs(run_id), submission_hash TEXT NOT NULL,
+            result_json TEXT NOT NULL, memo_path TEXT NOT NULL, completed_at TEXT NOT NULL
+        )""")
+        connection.execute("UPDATE metadata SET value = '4' WHERE key = 'schema_version'")
+
     def create_run(
         self,
         *,
@@ -506,6 +538,97 @@ class PluginStore:
         if row is None:
             raise RunNotFound(f"RUN_NOT_FOUND: analysis {run_id} does not exist")
         return _run_record(row)
+
+    def save_option_snapshot(
+        self, run_id: str, expiration: str, fetched_at: str, payload: dict
+    ) -> dict:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT OR IGNORE INTO option_snapshots "
+                "(snapshot_id, run_id, expiration, fetched_at, payload_json) VALUES (?, ?, ?, ?, ?)",
+                (str(uuid4()), run_id, expiration, fetched_at, canonical_json(payload)),
+            )
+            row = connection.execute(
+                "SELECT * FROM option_snapshots WHERE run_id = ? AND expiration = ?",
+                (run_id, expiration),
+            ).fetchone()
+        return {
+            "snapshot_id": row["snapshot_id"], "run_id": row["run_id"],
+            "expiration": row["expiration"], "fetched_at": row["fetched_at"],
+            "payload": json.loads(row["payload_json"]),
+        }
+
+    def get_option_snapshot(self, snapshot_id: str) -> dict:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM option_snapshots WHERE snapshot_id = ?", (snapshot_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(snapshot_id)
+        return {
+            "snapshot_id": row["snapshot_id"], "run_id": row["run_id"],
+            "expiration": row["expiration"], "fetched_at": row["fetched_at"],
+            "payload": json.loads(row["payload_json"]),
+        }
+
+    def list_option_snapshots(self, run_id: str) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM option_snapshots WHERE run_id = ? ORDER BY expiration, snapshot_id",
+                (run_id,),
+            ).fetchall()
+        return [
+            {"snapshot_id": row["snapshot_id"], "run_id": row["run_id"],
+             "expiration": row["expiration"], "fetched_at": row["fetched_at"],
+             "payload": json.loads(row["payload_json"])}
+            for row in rows
+        ]
+
+    def save_option_assessment(
+        self, run_id: str, submission_hash: str, result: dict, memo_path: str, now: str
+    ) -> tuple[dict, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM option_assessments WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is not None:
+                if row["submission_hash"] != submission_hash:
+                    raise RequestIdConflict(
+                        f"REQUEST_ID_CONFLICT: option assessment already submitted for {run_id}"
+                    )
+                return {
+                    "run_id": row["run_id"], "submission_hash": row["submission_hash"],
+                    "result": json.loads(row["result_json"]), "memo_path": row["memo_path"],
+                    "completed_at": row["completed_at"],
+                }, False
+            connection.execute(
+                "INSERT INTO option_assessments "
+                "(run_id, submission_hash, result_json, memo_path, completed_at) VALUES (?, ?, ?, ?, ?)",
+                (run_id, submission_hash, canonical_json(result), memo_path, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM option_assessments WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return {
+            "run_id": row["run_id"], "submission_hash": row["submission_hash"],
+            "result": json.loads(row["result_json"]), "memo_path": row["memo_path"],
+            "completed_at": row["completed_at"],
+        }, True
+
+    def get_option_assessment(self, run_id: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM option_assessments WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": row["run_id"], "submission_hash": row["submission_hash"],
+            "result": json.loads(row["result_json"]), "memo_path": row["memo_path"],
+            "completed_at": row["completed_at"],
+        }
 
     def get_snapshot(self, run_id: str) -> AnalysisSnapshot:
         with self._connect() as connection:

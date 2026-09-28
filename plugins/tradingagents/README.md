@@ -91,3 +91,15 @@ Codex to load the installed local plugin.
 
 Data-source availability varies by provider, credentials, and instrument. Codex subscription
 usage is controlled by the host and plugin activation does not grant unlimited model usage.
+
+## Options assessments
+
+The `options-trading` skill handles requests for cash-secured puts, long calls, and options
+comparisons. Invoke it explicitly with `$options-trading`; ordinary stock analysis continues to
+use `trading-analysis`. It completes or resumes a same-day stock analysis, reads current option
+quotes, and saves one assessment per run. Historical quotes and crypto options are unsupported;
+a new same-day run is required to refresh quotes. Quotes do not promise fills, and the plugin
+never places orders. The assessment memo is saved alongside the full stock report.
+
+After changing the skill or plugin, refresh the local copy using the command above and restart
+Codex to load it.

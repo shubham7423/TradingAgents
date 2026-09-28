@@ -49,7 +49,7 @@ class Capabilities(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runtime_version: str
-    schema_version: int = 3
+    schema_version: int = 4
     mcp_sdk_version: str | None
     available_tools: list[str]
     planned_data_tools: list[str]
@@ -130,6 +130,10 @@ def get_capabilities() -> Capabilities:
             "get_prediction_markets",
             "fetch_stocktwits_messages",
             "fetch_reddit_posts",
+            "list_option_expirations",
+            "get_option_chain",
+            "get_option_assessment",
+            "submit_option_assessment",
         ],
         planned_data_tools=[],
         roles=roles,

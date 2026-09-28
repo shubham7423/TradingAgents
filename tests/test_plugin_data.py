@@ -1,5 +1,6 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -1762,3 +1763,163 @@ def test_finalize_analysis_is_public_and_strict(store, monkeypatch):
     assert tools.finalize_analysis in tools.public_operations()
     with pytest.raises(ValidationError):
         data.AnalysisFinalizationResult.model_validate({**result.model_dump(), "extra": True})
+
+
+def test_option_tools_cache_chain_pages_for_completed_current_stock(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    monkeypatch.setattr(data.option_data, "fetch_expirations", lambda symbol: ("2026-10-16",))
+    rows = [
+        {"contract_symbol": f"AAPL-{i}", "currency": "USD", "contract_size": "REGULAR"}
+        for i in range(2)
+    ]
+    calls = []
+    monkeypatch.setattr(data.option_data, "fetch_chain", lambda symbol, expiration: (
+        calls.append((symbol, expiration)) or {
+            "expiration": expiration, "underlying": {"symbol": symbol}, "contracts": rows,
+        }
+    ))
+
+    assert tools.list_option_expirations(run.run_id)["expirations"] == ["2026-10-16"]
+    first = tools.get_option_chain(run.run_id, "2026-10-16", limit=1)
+    second = tools.get_option_chain(run.run_id, "2026-10-16", offset=first["next_offset"], limit=1)
+    assert first["snapshot_id"] == second["snapshot_id"]
+    assert first["next_offset"] == 1 and second["complete"] is True
+    assert first["source"] == "Yahoo Finance" and first["fetched_at"]
+    assert calls == [("AAPL", "2026-10-16")]
+
+
+def test_option_assessment_persists_replays_repairs_memo_and_conflicts(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    snapshot = store.save_option_snapshot(run.run_id, "2026-10-16", "2026-09-15T14:00:00Z", {
+        "underlying": {"regularMarketPrice": 155}, "contracts": [{
+            "contract_symbol": "AAPL261016P00150000", "side": "put", "strike": 150,
+            "bid": 2, "ask": 2.2, "currency": "USD", "contract_size": "REGULAR",
+        }],
+    })
+    candidate = {"strategy": "cash_secured_put", "snapshot_id": snapshot["snapshot_id"],
+                 "contract_symbol": "AAPL261016P00150000", "rationale": "Entry below support",
+                 "expiry_rationale": "Allows thesis time", "failure_condition": "Support breaks"}
+    submitted = tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
+                                               "cash_secured_put")
+    memo = Path(submitted["memo_path"])
+    memo_text = memo.read_text()
+    assert memo.is_file() and "Collateral: $15000.00" in memo_text
+    assert "Expiration: 2026-10-16; strike: $150.00" in memo_text
+    assert "Preferred strategy: cash_secured_put" in memo_text
+    memo.unlink()
+    replay = tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
+                                            "cash_secured_put")
+    assert replay == submitted and memo.is_file()
+    with pytest.raises(RequestIdConflict):
+        tools.submit_option_assessment(run.run_id, "Changed thesis", [candidate], "cash_secured_put")
+    assert store.get_option_assessment(run.run_id) == submitted
+    assert data.PluginTools(PluginStore(store.database_path.parent)).get_option_assessment(run.run_id) == submitted
+
+
+def test_option_assessment_retry_recovers_after_atomic_memo_write_failure(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    snapshot = store.save_option_snapshot(run.run_id, "2026-10-16", "2026-09-15T14:00:00Z", {
+        "underlying": {}, "contracts": [{"contract_symbol": "AAPL261016P00150000", "side": "put",
+            "strike": 150, "bid": 2, "ask": 2.2, "currency": "USD", "contract_size": "REGULAR"}],
+    })
+    candidate = {"strategy": "cash_secured_put", "snapshot_id": snapshot["snapshot_id"],
+                 "contract_symbol": "AAPL261016P00150000", "rationale": "Entry below support",
+                 "expiry_rationale": "Allows thesis time", "failure_condition": "Support breaks"}
+    writer = data.PluginTools._write_option_memo
+    attempts = 0
+
+    def fail_once(path, content):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("disk temporarily unavailable")
+        writer(path, content)
+
+    monkeypatch.setattr(data.PluginTools, "_write_option_memo", staticmethod(fail_once))
+    with pytest.raises(OSError, match="temporarily"):
+        tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
+                                       "cash_secured_put")
+    receipt = store.get_option_assessment(run.run_id)
+    assert receipt is not None
+    assert not Path(receipt["memo_path"]).exists()
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-16")
+    assert tools.submit_option_assessment(run.run_id, "Bullish above support", [candidate],
+                                          "cash_secured_put") == receipt
+    assert Path(receipt["memo_path"]).is_file()
+    assert attempts == 2
+    with pytest.raises(RequestIdConflict):
+        tools.submit_option_assessment(run.run_id, "Changed thesis", [candidate], "cash_secured_put")
+
+
+@pytest.mark.parametrize(("offset", "limit"), [(-1, 1), (0, 0), (0, 101)])
+def test_option_chain_bounds(tools, offset, limit):
+    with pytest.raises(ValueError):
+        tools.get_option_chain("unknown", "2026-10-16", offset, limit)
+
+
+def test_option_chain_provider_failure_is_unavailable_and_not_saved(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    monkeypatch.setattr(data.option_data, "fetch_expirations", lambda *_: ("2026-10-16",))
+    monkeypatch.setattr(data.option_data, "fetch_chain", lambda *_: (_ for _ in ()).throw(RuntimeError("offline")))
+    result = tools.get_option_chain(run.run_id, "2026-10-16")
+    assert result["status"] == "unavailable"
+    assert store.list_option_snapshots(run.run_id) == []
+
+
+@pytest.mark.parametrize("analysis_date", ["2026-09-14", "2026-09-15"])
+def test_options_reject_non_current_or_crypto_run(tools, store, monkeypatch, analysis_date):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store, analysis_date=analysis_date)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+        if analysis_date == "2026-09-15":
+            connection.execute(
+                "UPDATE runs SET normalized_inputs_json = json_set(normalized_inputs_json, '$.asset_type', 'crypto') WHERE run_id = ?",
+                (run.run_id,),
+            )
+    with pytest.raises(ValueError, match="options require"):
+        tools.list_option_expirations(run.run_id)
+
+
+def test_options_reject_stock_labeled_crypto_symbol(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(
+        store,
+        instrument={"canonical_symbol": "BTC-USD", "source": "yfinance", "context": "Bitcoin"},
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    with pytest.raises(ValueError, match="US stock or ETF"):
+        tools.list_option_expirations(run.run_id)
+
+
+def test_option_chain_rejects_unlisted_expiration(tools, store, monkeypatch):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    run = _create_evidence_run(store)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runs SET status = 'completed' WHERE run_id = ?", (run.run_id,))
+    monkeypatch.setattr(data.option_data, "fetch_expirations", lambda *_: ("2026-10-23",))
+    monkeypatch.setattr(
+        data.option_data, "fetch_chain", lambda *_: pytest.fail("unlisted expiration fetched")
+    )
+    with pytest.raises(ValueError, match="expiration .* unavailable"):
+        tools.get_option_chain(run.run_id, "2026-10-16")
+
+
+@pytest.mark.parametrize("expiration", ["not-a-date", "2026-09-14", "2026-10-16T00:00:00"])
+def test_option_chain_rejects_invalid_or_expired_expiration(tools, monkeypatch, expiration):
+    monkeypatch.setattr(data, "get_current_date", lambda: "2026-09-15")
+    with pytest.raises(ValueError, match="expiration"):
+        tools.get_option_chain("unused", expiration)
